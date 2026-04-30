@@ -1,0 +1,27 @@
+[Unit]
+Description=WeatherPolyBot — Temperature Prediction & Polymarket Edge Bot
+Documentation=https://github.com/YOUR_USERNAME/weather-poly-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=weatherbot
+Group=weatherbot
+WorkingDirectory=/opt/weather-poly-bot
+EnvironmentFile=/opt/weather-poly-bot/.env
+ExecStart=/opt/weather-poly-bot/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weatherpolybot
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/weather-poly-bot
+
+[Install]
+WantedBy=multi-user.target
