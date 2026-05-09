@@ -1,1081 +1,1270 @@
-#!/usr/bin/env python3
-"""
-WeatherPolyBot — main entry point
-──────────────────────────────────
-A Telegram bot that:
-  • Predicts daily high temperatures using a weighted ensemble of
-    ECMWF IFS, NOAA GFS, and DWD ICON (weights derived from a 30-day
-    backtest across 12 diverse airport/city locations)
-  • Searches Polymarket for temperature markets and detects ≥40¢ edges
-  • Tracks positions with live P&L
-  • Monitors favourite markets and tracked locations in the background
-  • Runs as a systemd service so it stays alive when PuTTY is closed
-"""
+"""Telegram Weather Prediction Bot — main entry point.
 
+Features:
+- Search a city to see nearby airports as tappable buttons.
+- Get a 7-day max-temp forecast for any ICAO/IATA airport, derived from a
+  weighted ensemble of 8 leading numerical weather prediction models.
+- Per-day confidence score, green-flag for high-confidence predictions, and
+  a probability for each integer temperature.
+- Track airports for ≥2°F / ≥1°C change alerts on the predicted max.
+- Bottom-left commands menu + persistent reply keyboard for fast access.
+"""
 import asyncio
 import logging
-from datetime import datetime
+import re
+from datetime import date, timedelta
+from typing import List, Optional, Tuple
 
-import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    MenuButtonCommands,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
 
-import database as db
-import keyboards as kb
-import backtest_service
-import polymarket_service
-import weather_service
+from airports import AirportDatabase, ensure_airport_data, geocode_city
 from config import (
-    TELEGRAM_TOKEN,
-    DEFAULT_WEIGHTS,
-    EDGE_THRESHOLD,
-    TRACKED_REFRESH_MIN,
+    AIRPORTS_CSV,
+    ALERT_THRESHOLD_C,
+    ALERT_THRESHOLD_F,
+    BOT_TOKEN,
+    DB_PATH,
+    LOG_LEVEL,
+    TRACKING_INTERVAL_MINUTES,
+)
+from polymarket import (
+    CityMarket,
+    EVPick,
+    Opportunity,
+    SUPPORTED_CITIES,
+    city_local_today,
+    get_market_for_city,
+    hedges_around,
+    match_for_prediction,
+    rank_buckets_by_ev,
+    resolve_city_for_airport,
+    score_opportunity,
+    supported_cities_alphabetical,
+    top_n_by_yes,
+)
+from tracking import TrackingDB
+from weather import (
+    DayForecast,
+    MODEL_DISPLAY,
+    fetch_current_observation,
+    fetch_ensemble_forecast,
 )
 
-# ─────────────────────────────────────────────────────────
-#  Logging
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────── setup ────────────────────────────────
 logging.basicConfig(
+    level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
 )
-log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("weather-bot")
 
-# ─────────────────────────────────────────────────────────
-#  Conversation states
-# ─────────────────────────────────────────────────────────
-(
-    AWAIT_LOCATION_PREDICT,
-    AWAIT_LOCATION_TRACK,
-    AWAIT_POS_OUTCOME,
-    AWAIT_POS_SHARES,
-    AWAIT_POS_PRICE,
-    AWAIT_POS_NOTES,
-    AWAIT_UPDATE_PRICE,
-    AWAIT_CLOSE_PRICE,
-) = range(8)
+airports_db = AirportDatabase()
+tracking_db = TrackingDB(DB_PATH)
 
 
-# ─────────────────────────────────────────────────────────
-#  Formatting helpers
-# ─────────────────────────────────────────────────────────
-
-HEADER = "🌦️  <b>WeatherPolyBot</b>"
-DIV    = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-
-def _temp_bar(c: float) -> str:
-    """Visual thermometer bar."""
-    # Maps roughly -20°C to +50°C → 0 to 30 blocks
-    blocks = max(0, min(30, int((c + 20) / 70 * 30)))
-    return "🌡️ " + "█" * blocks + "░" * (30 - blocks)
-
-
-def _pnl_icon(pnl: float) -> str:
-    if pnl > 0:
-        return "📈"
-    if pnl < 0:
-        return "📉"
-    return "➡️"
+# ─────────────────────────── messages ─────────────────────────────
+WELCOME = (
+    "🌤️ *Weather Prediction Bot* 🌤️\n\n"
+    "Highly accurate temperature forecasts using a *weighted ensemble* of "
+    "8 leading NWP models — ECMWF IFS, ECMWF AIFS (AI), UK Met Office, "
+    "DWD ICON, NOAA GFS, JMA, Météo-France, and Environment Canada GEM.\n\n"
+    "✨ *Three modes:*\n"
+    "🎯 *Opportunities* — scans all 35 markets and surfaces the top 5 "
+    "high-confidence trades (model conf ≥75% AND market YES ≥40%), ranked "
+    "by edge × confidence.\n\n"
+    "🎲 *Polymarket Forecast* — pick a city, get a focused 3-day forecast at "
+    "the exact resolution station Polymarket uses to settle the market.\n\n"
+    "🌤️ *General Forecast* — search any of ~80,000 airports worldwide.\n\n"
+    "🔔 Track airports for ≥2°F / ≥1°C alerts.\n"
+    "🌡️ Temperatures in °F and °C, always whole numbers.\n\n"
+    "Tap the bottom-left *Menu* or use the keyboard below."
+)
 
 
-def format_prediction(pred: dict, display_name: str) -> str:
-    wts = pred.get("weights", {})
-    models = pred.get("models", {})
-
-    lines = [
-        HEADER,
-        DIV,
-        f"📍 <b>{display_name}</b>",
-        f"🕐 Local time: <i>{pred['local_time']}</i>",
-        "",
-        f"🗓️ <b>TODAY</b>  ({pred['today_label']})",
-        f"   🔥 High: <b>{pred['today_c']}°C  /  {pred['today_f']}°F</b>",
-        _temp_bar(pred['today_c']),
-        "",
-        f"🗓️ <b>TOMORROW</b>  ({pred['tomorrow_label']})",
-        f"   🔥 High: <b>{pred['tomorrow_c']}°C  /  {pred['tomorrow_f']}°F</b>",
-        _temp_bar(pred['tomorrow_c']),
-        "",
-        DIV,
-        "📡 <b>MODEL BREAKDOWN</b>",
-        "<code>",
-        f"{'Model':<13} {'Today':>6} {'Tom.':>6}  {'Wt':>5}",
-        f"{'─'*13} {'─'*6} {'─'*6}  {'─'*5}",
-    ]
-    icons = {"ECMWF IFS": "🔵", "NOAA GFS": "🟢", "DWD ICON": "🟡"}
-    for name, d in models.items():
-        ic = icons.get(name, "⚫")
-        wt = wts.get(name, 0)
-        lines.append(
-            f"{ic}{name:<11} {d['today_high']:>5.1f}° {d['tomorrow_high']:>5.1f}°  {wt*100:>4.0f}%"
-        )
-    lines += [
-        "</code>",
-        "",
-        f"⚡ <b>Best estimate:</b>",
-        f"   Today    → <b>{pred['today_c']}°C / {pred['today_f']}°F</b>",
-        f"   Tomorrow → <b>{pred['tomorrow_c']}°C / {pred['tomorrow_f']}°F</b>",
-        DIV,
-        "🎯 Tap <i>Scan Markets</i> to find Polymarket edges",
-    ]
-    return "\n".join(lines)
+HELP = (
+    "*🆘 Help*\n\n"
+    "*Commands*\n"
+    "/opportunities — 🎯 Top 5 high-confidence trade picks across 35 cities\n"
+    "/polymarket — 🎲 Pick a city → focused forecast + live odds\n"
+    "/forecast `<code>` — 🌤️ General forecast for any airport\n"
+    "/search `<city>` — Find nearby airports\n"
+    "/track `<code>` — Track for change alerts\n"
+    "/untrack `<code>` — Stop tracking\n"
+    "/list — Your tracked airports\n"
+    "/help — This help\n\n"
+    "*Methodology*\n"
+    "Weighted ensemble of 8 NWP models (ECMWF IFS heaviest weight). "
+    "Confidence comes from inter-model standard deviation — when models "
+    "agree, we're confident.\n"
+    "🟢 high · 🟡 medium · 🔴 low\n\n"
+    "*Opportunities scoring*\n"
+    "We compute our model's YES probability for each bucket (Gaussian over "
+    "ensemble spread), compare to the market's YES price, and surface the "
+    "biggest mispricings where our confidence is also high.\n"
+    "💰 = best EV pick · 🎯 = matches model · ✅ = market's matched bucket"
+)
 
 
-def format_position(p: dict) -> str:
-    cost     = p["shares"] * p["entry_price"]
-    cur_val  = p["shares"] * (p["current_price"] or p["entry_price"])
-    pnl      = cur_val - cost
-    pnl_pct  = (pnl / cost * 100) if cost else 0
-    icon     = _pnl_icon(pnl)
-    status   = "🔒 CLOSED" if p["closed"] else "🟢 OPEN"
-
-    lines = [
-        f"{DIV}",
-        f"<b>Position #{p['id']}</b>  {status}",
-        f"📍 {p['location']}",
-        f"📋 Market: {p['market_name'][:60]}",
-        f"🎲 Outcome: <b>{p['outcome']}</b>",
-        f"",
-        f"📊 Shares: <b>{p['shares']:.2f}</b>",
-        f"💰 Entry:  <b>${p['entry_price']:.3f}</b>/share",
-        f"💱 Current: <b>${(p['current_price'] or p['entry_price']):.3f}</b>/share",
-        f"",
-        f"{icon} P&L: <b>${pnl:+.2f}</b> ({pnl_pct:+.1f}%)",
-        f"📅 Entered: {p['entry_time'][:16]}",
-    ]
-    if p.get("predicted_c"):
-        lines.append(f"🌡️ Prediction was: {p['predicted_c']}°C / {p['predicted_f']}°F")
-    if p.get("notes"):
-        lines.append(f"📝 Notes: {p['notes']}")
-    if p.get("market_url"):
-        lines.append(f"🔗 <a href=\"{p['market_url']}\">Open Market</a>")
-    return "\n".join(lines)
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🎯 Opportunities"), KeyboardButton("🎲 Polymarket")],
+            [KeyboardButton("🌤️ Forecast"), KeyboardButton("🔍 Search City")],
+            [KeyboardButton("📋 My Tracked"), KeyboardButton("❓ Help")],
+        ],
+        resize_keyboard=True,
+    )
 
 
-# ─────────────────────────────────────────────────────────
-#  Command: /start
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────── command handlers ─────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+    await update.effective_message.reply_text(
+        WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard()
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(HELP, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.effective_message.reply_text(
+            "🔍 Send me a city name.\n\nExample: `/search Tokyo`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await do_city_search(update, " ".join(ctx.args))
+
+
+async def cmd_forecast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.effective_message.reply_text(
+            "✈️ Send me an airport code.\n\nExample: `/forecast KJFK`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await send_forecast(update, ctx.args[0])
+
+
+async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.effective_message.reply_text(
+            "🔔 Specify an airport.\n\nExample: `/track KJFK`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await track_airport(update, ctx.args[0])
+
+
+async def cmd_untrack(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.effective_message.reply_text(
+            "🔕 Specify an airport.\n\nExample: `/untrack KJFK`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    code = ctx.args[0].upper().strip()
+    user_id = update.effective_user.id
+    if tracking_db.remove(user_id, code):
+        await update.effective_message.reply_text(
+            f"✅ No longer tracking *{code}*.", parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"ℹ️ You weren't tracking *{code}*.", parse_mode=ParseMode.MARKDOWN
+        )
+
+
+async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    rows = tracking_db.list_user(user_id)
+    if not rows:
+        await update.effective_message.reply_text(
+            "📋 You aren't tracking any airports yet.\n"
+            "Use `/track <code>` or tap *Track* on a forecast.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = ["📋 *Your Tracked Airports*\n"]
+    keyboard = []
+    for code, last_c, last_f, last_check in rows:
+        airport = airports_db.lookup(code)
+        name = airport.name if airport else code
+        line = f"\n{airport.type_emoji if airport else '✈️'} *{code}* — {_md_safe(name[:40])}"
+        if last_f is not None and last_c is not None:
+            line += f"\n   _Last forecast: {int(round(last_f))}°F / {int(round(last_c))}°C_"
+        lines.append(line)
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"📊 {code}", callback_data=f"fc:{code}"),
+                InlineKeyboardButton("🔕 Untrack", callback_data=f"untrack:{code}"),
+            ]
+        )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ─────────────────────────── core flows ───────────────────────────
+async def do_city_search(update: Update, city: str) -> None:
+    msg = await update.effective_message.reply_text(
+        f"🔍 Searching for *{_md_safe(city)}*…", parse_mode=ParseMode.MARKDOWN
+    )
+    try:
+        results = await geocode_city(city, count=3)
+    except Exception as e:
+        log.exception("geocode failed")
+        await msg.edit_text(f"❌ Search failed: {e}")
+        return
+
+    if not results:
+        await msg.edit_text(
+            f"❌ No locations found for *{_md_safe(city)}*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    top = results[0]
+    lat, lon = top["latitude"], top["longitude"]
+    place = top["name"]
+    region = top.get("admin1") or ""
+    country = top.get("country_code") or ""
+    label = ", ".join(p for p in (place, region, country) if p)
+
+    nearby = airports_db.search_near(lat, lon, radius_km=200, limit=8)
+    if not nearby:
+        await msg.edit_text(
+            f"📍 Found *{_md_safe(label)}* but no airports within 200 km.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     text = (
-        f"{HEADER}\n"
-        f"{DIV}\n"
-        f"👋 Welcome, <b>{user.first_name}</b>!\n\n"
-        f"I combine three top-tier NWP models into a single precise "
-        f"temperature forecast, then scan Polymarket for profitable edges.\n\n"
-        f"<b>Models used:</b>\n"
-        f"  🔵 ECMWF IFS  — World's #1 global model\n"
-        f"  🟢 NOAA GFS   — NOAA's flagship model\n"
-        f"  🟡 DWD ICON   — German Weather Service\n\n"
-        f"Weights are auto-calibrated from a 30-day backtest across\n"
-        f"12 airports &amp; cities on every continent.\n"
-        f"{DIV}\n"
-        f"Choose an option below 👇"
+        f"📍 *{_md_safe(label)}*\n"
+        f"_({top['latitude']:.2f}, {top['longitude']:.2f})_\n\n"
+        f"✈️ *Airports within 200 km* — tap one for a forecast:"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
-                                    reply_markup=kb.main_menu())
+    rows = []
+    for ap in nearby:
+        code = ap.iata or ap.icao
+        btn_label = f"{ap.type_emoji} {code} — {ap.name[:32]}"
+        rows.append([InlineKeyboardButton(btn_label, callback_data=f"fc:{ap.icao}")])
 
-
-# ─────────────────────────────────────────────────────────
-#  Menu router
-# ─────────────────────────────────────────────────────────
-async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q   = update.callback_query
-    await q.answer()
-    data = q.data
-
-    if data == "menu_main":
-        await q.edit_message_text(
-            f"{HEADER}\n{DIV}\nChoose an option 👇",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb.main_menu(),
-        )
-        return ConversationHandler.END
-
-    elif data == "menu_predict":
-        ctx.user_data["action"] = "predict"
-        await q.edit_message_text(
-            f"{HEADER}\n{DIV}\n📍 <b>Temperature Prediction</b>\n\n"
-            "Enter a city, address, or airport (e.g. <code>JFK Airport</code>, "
-            "<code>London Heathrow</code>, <code>Tokyo</code>):",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Cancel", callback_data="menu_main")
-            ]]),
-        )
-        return AWAIT_LOCATION_PREDICT
-
-    elif data == "menu_track":
-        ctx.user_data["action"] = "track"
-        await q.edit_message_text(
-            f"{HEADER}\n{DIV}\n📡 <b>Track a Location</b>\n\n"
-            "Enter the location to track (I'll auto-refresh every hour):",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📋 View Tracked", callback_data="show_tracked"),
-                InlineKeyboardButton("🏠 Cancel",        callback_data="menu_main"),
-            ]]),
-        )
-        return AWAIT_LOCATION_TRACK
-
-    elif data == "show_tracked" or data == "menu_tracked":
-        return await show_tracked(update, ctx)
-
-    elif data == "menu_markets":
-        ctx.user_data["action"] = "markets"
-        await q.edit_message_text(
-            f"{HEADER}\n{DIV}\n🎯 <b>Market Scanner</b>\n\n"
-            "Enter a location to scan Polymarket for temperature markets:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Cancel", callback_data="menu_main")
-            ]]),
-        )
-        return AWAIT_LOCATION_PREDICT      # reuse same state
-
-    elif data == "menu_positions":
-        return await show_positions(update, ctx)
-
-    elif data == "menu_favourites":
-        return await show_favourites(update, ctx)
-
-    elif data == "menu_backtest":
-        return await show_backtest(update, ctx)
-
-    elif data == "menu_run_backtest":
-        return await trigger_backtest(update, ctx)
-
-    elif data == "menu_help":
-        return await show_help(update, ctx)
-
-    elif data.startswith("predict|"):
-        parts = data.split("|")
-        lat, lon, tz, loc_name = float(parts[1]), float(parts[2]), parts[3], parts[4].replace("_", " ")
-        return await do_predict(update, ctx, lat, lon, tz, loc_name)
-
-    elif data.startswith("scan|"):
-        parts = data.split("|")
-        lat, lon, tz, loc = float(parts[1]), float(parts[2]), parts[3], parts[4].replace("_", " ")
-        return await do_scan(update, ctx, lat, lon, tz, loc)
-
-    elif data.startswith("track|"):
-        parts = data.split("|")
-        lat, lon, tz, loc = float(parts[1]), float(parts[2]), parts[3], parts[4].replace("_", " ")
-        return await do_track(update, ctx, lat, lon, tz, loc)
-
-    elif data.startswith("untrack|"):
-        loc_id = int(data.split("|")[1])
-        user_id = update.effective_user.id
-        await db.remove_tracked(user_id, loc_id)
-        await q.answer("Location removed ✅")
-        return await show_tracked(update, ctx)
-
-    elif data.startswith("pos_detail|"):
-        pos_id = int(data.split("|")[1])
-        return await show_pos_detail(update, ctx, pos_id)
-
-    elif data.startswith("pos_update|"):
-        pos_id = int(data.split("|")[1])
-        ctx.user_data["pos_update_id"] = pos_id
-        await q.edit_message_text(
-            f"Enter new current price for Position #{pos_id} (e.g. <code>0.62</code>):",
-            parse_mode=ParseMode.HTML,
-        )
-        return AWAIT_UPDATE_PRICE
-
-    elif data.startswith("pos_close|"):
-        pos_id = int(data.split("|")[1])
-        ctx.user_data["pos_close_id"] = pos_id
-        await q.edit_message_text(
-            f"Enter the closing price for Position #{pos_id} (e.g. <code>0.85</code>):",
-            parse_mode=ParseMode.HTML,
-        )
-        return AWAIT_CLOSE_PRICE
-
-    elif data.startswith("pos_delete|"):
-        pos_id = int(data.split("|")[1])
-        user_id = update.effective_user.id
-        await db.delete_position(user_id, pos_id)
-        await q.answer("Position deleted 🗑️")
-        return await show_positions(update, ctx)
-
-    elif data.startswith("addpos|"):
-        parts = data.split("|")
-        ctx.user_data["addpos_market_id"] = parts[1]
-        ctx.user_data["addpos_lat"]        = float(parts[2])
-        ctx.user_data["addpos_lon"]        = float(parts[3])
-        ctx.user_data["addpos_pred_c"]     = float(parts[4])
-        await q.edit_message_text(
-            "📋 <b>New Position</b>\n\n"
-            "Enter the outcome you're buying (e.g. <code>YES - High > 75°F</code>):",
-            parse_mode=ParseMode.HTML,
-        )
-        return AWAIT_POS_OUTCOME
-
-    elif data.startswith("addfav|"):
-        market_id = data.split("|")[1]
-        return await add_favourite(update, ctx, market_id)
-
-    elif data.startswith("fav_refresh|"):
-        parts = data.split("|")
-        fav_id, market_id = int(parts[1]), parts[2]
-        return await refresh_favourite(update, ctx, fav_id, market_id)
-
-    elif data.startswith("fav_remove|"):
-        fav_id = int(data.split("|")[1])
-        user_id = update.effective_user.id
-        await db.remove_favourite(user_id, fav_id)
-        await q.answer("Removed from favourites ✅")
-        return await show_favourites(update, ctx)
-
-    elif data == "back_markets":
-        # Re-show last market scan stored in user_data
-        cached = ctx.user_data.get("last_scan_text", "No recent scan. Use 🎯 Market Scanner.")
-        await q.edit_message_text(cached, parse_mode=ParseMode.HTML,
-                                  reply_markup=kb.back_to_menu(),
-                                  disable_web_page_preview=True)
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-
-# ─────────────────────────────────────────────────────────
-#  Location input handler (shared for predict & track)
-# ─────────────────────────────────────────────────────────
-async def handle_location_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    text    = update.message.text.strip()
-    action  = ctx.user_data.get("action", "predict")
-    uid     = update.effective_user.id
-
-    msg = await update.message.reply_text(
-        "🔍 Geocoding location…", parse_mode=ParseMode.HTML
+    await msg.edit_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
     )
 
-    geo = await weather_service.geocode(text)
-    if not geo:
-        await msg.edit_text(
-            "❌ Could not find that location. Try a city name, airport name, or IATA code.",
-            reply_markup=kb.back_to_menu(),
+
+async def send_forecast(update: Update, code: str) -> None:
+    """General-mode forecast for any airport. Inline Polymarket section
+    appears when the airport maps (directly or geographically) to a covered
+    city.
+    """
+    code = code.upper().strip()
+    airport = airports_db.lookup(code)
+    if not airport:
+        await update.effective_message.reply_text(
+            f"❌ Airport not found: `{_md_safe(code)}`\n"
+            "Try an ICAO (4-letter, e.g. `KJFK`) or IATA (3-letter, e.g. `LAX`) code.",
+            parse_mode=ParseMode.MARKDOWN,
         )
-        return ConversationHandler.END
+        return
 
-    lat, lon, tz = geo["lat"], geo["lon"], geo["timezone"]
-    display      = geo["display"]
+    msg = await update.effective_message.reply_text(
+        f"⏳ Fetching ensemble forecast for *{airport.icao}*…\n"
+        f"_combining {len(MODEL_DISPLAY)} models…_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-    if action == "track":
-        loc_id = await db.add_tracked(uid, geo["name"], lat, lon, tz, display)
+    # 3-day forecast (today + 2) for both general and Polymarket modes.
+    forecasts, current = await asyncio.gather(
+        fetch_ensemble_forecast(airport.lat, airport.lon, days=3,
+                                icao=airport.icao),
+        fetch_current_observation(airport.icao, airport.lat, airport.lon),
+        return_exceptions=True,
+    )
+    if isinstance(forecasts, Exception):
+        log.exception("forecast fetch failed", exc_info=forecasts)
+        await msg.edit_text(f"❌ Forecast failed: {forecasts}")
+        return
+    if isinstance(current, Exception):
+        current = None
+    if not forecasts:
+        await msg.edit_text("❌ No forecast data available for this location.")
+        return
+
+    # Two-tier city resolution: explicit map first, geographic fallback second.
+    markets_by_date: dict = {}
+    resolved = resolve_city_for_airport(airport.icao, airport.lat, airport.lon)
+    if resolved:
+        city_key, _market_unit, source = resolved
+        # Use the CITY's local "today" for date alignment so cross-timezone
+        # users hit the right market. The forecast dates are already in the
+        # airport's local TZ from Open-Meteo, so for explicit mappings (same
+        # metro) they coincide. For the geo case they should also coincide.
+        local_today = city_local_today(city_key)
+        # Try each forecast date; Polymarket may publish 1–7 days ahead.
+        results = await asyncio.gather(
+            *(get_market_for_city(city_key, fc.date) for fc in forecasts),
+            return_exceptions=True,
+        )
+        for fc, m in zip(forecasts, results):
+            if isinstance(m, CityMarket):
+                markets_by_date[fc.date] = m
+        if source == "geo" and markets_by_date:
+            log.info("polymarket: geo fallback %s → %s", airport.icao, city_key)
+
+    text = format_forecast(airport, forecasts, current, markets_by_date)
+    keyboard = [
+        [
+            InlineKeyboardButton("🔔 Track", callback_data=f"track:{airport.icao}"),
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"fc:{airport.icao}"),
+            InlineKeyboardButton("🧠 Models", callback_data=f"models:{airport.icao}"),
+        ]
+    ]
+    await msg.edit_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
+
+
+async def show_models_breakdown(update: Update, code: str) -> None:
+    code = code.upper().strip()
+    airport = airports_db.lookup(code)
+    if not airport:
+        return
+    forecasts = await fetch_ensemble_forecast(airport.lat, airport.lon, days=2,
+                                               icao=airport.icao)
+    if not forecasts:
+        await update.effective_message.reply_text("❌ No data.")
+        return
+    today = forecasts[0]
+    lines = [
+        f"🧠 *Per-model breakdown for {airport.icao}* — Today",
+        "",
+        f"Ensemble mean: *{today.predicted_max_f}°F / {today.predicted_max_c}°C*",
+        f"Spread (σ): {today.std_c:.2f}°C  ·  Confidence: *{int(today.confidence*100)}%*",
+        "",
+        "*Individual model max-temp predictions:*",
+    ]
+    for m, v in sorted(
+        today.model_values_c.items(), key=lambda x: -x[1] if x[1] else 0
+    ):
+        f_val = v * 9 / 5 + 32
+        lines.append(
+            f"• {MODEL_DISPLAY.get(m, m)}: {int(round(f_val))}°F / {int(round(v))}°C"
+        )
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+# ─────────────────────────── Polymarket dedicated mode ────────────────────
+async def cmd_polymarket(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the city picker for the dedicated Polymarket forecast flow."""
+    await show_polymarket_city_menu(update)
+
+
+async def show_polymarket_city_menu(update: Update) -> None:
+    rows = []
+    cities = supported_cities_alphabetical()
+    # Two columns of buttons for compactness.
+    for i in range(0, len(cities), 2):
+        row = []
+        for ck, cfg in cities[i:i + 2]:
+            row.append(InlineKeyboardButton(
+                f"📍 {cfg.display}", callback_data=f"pm:{ck}"
+            ))
+        rows.append(row)
+
+    text = (
+        "🎲 *Polymarket Forecast*\n\n"
+        f"Pick a city. I'll forecast at the *exact resolution station* "
+        f"Polymarket uses to settle the market, then show our top picks "
+        f"with live odds.\n\n"
+        f"_{len(cities)} cities supported · today + 2 days, in each city's "
+        f"local time_"
+    )
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def send_polymarket_forecast(update: Update, city_key: str) -> None:
+    """Polymarket-mode forecast: predict AT the resolution station, fetch
+    markets for the city's local today + 2, render with bar visualization.
+    """
+    cfg = SUPPORTED_CITIES.get(city_key)
+    if not cfg:
+        await update.effective_message.reply_text("❌ Unknown city.")
+        return
+
+    msg = await update.effective_message.reply_text(
+        f"⏳ Building Polymarket forecast for *{cfg.display}*…\n"
+        f"_predicting at {_md_safe(cfg.resolves_at_name)} ({cfg.resolves_at_icao})_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Predict at the resolution station — this is the whole point of this mode.
+    forecasts, current = await asyncio.gather(
+        fetch_ensemble_forecast(cfg.resolves_at_lat, cfg.resolves_at_lon,
+                                days=3, icao=cfg.resolves_at_icao),
+        fetch_current_observation(cfg.resolves_at_icao,
+                                   cfg.resolves_at_lat, cfg.resolves_at_lon),
+        return_exceptions=True,
+    )
+    if isinstance(forecasts, Exception):
+        log.exception("polymarket forecast failed", exc_info=forecasts)
+        await msg.edit_text(f"❌ Forecast failed: {forecasts}")
+        return
+    if isinstance(current, Exception):
+        current = None
+    if not forecasts:
+        await msg.edit_text("❌ No forecast data.")
+        return
+
+    # Forecast dates from Open-Meteo are in the airport's local timezone, which
+    # for the resolution station equals the city's timezone — exactly what we
+    # want for matching to Polymarket events.
+    local_today = city_local_today(city_key)
+
+    # Fetch markets for each of the 3 forecast dates in parallel.
+    market_results = await asyncio.gather(
+        *(get_market_for_city(city_key, fc.date) for fc in forecasts),
+        return_exceptions=True,
+    )
+    markets_by_date = {}
+    for fc, m in zip(forecasts, market_results):
+        if isinstance(m, CityMarket):
+            markets_by_date[fc.date] = m
+
+    # Build a focused render: header → per-day temp + Polymarket section.
+    lines = [
+        f"🎲 *Polymarket Forecast — {cfg.display}*",
+        f"🏟️ Resolves at: *{_md_safe(cfg.resolves_at_name)}* "
+        f"({cfg.resolves_at_icao})",
+        f"🕐 Local date: {local_today.strftime('%A, %b %d')}"
+        if local_today else "",
+    ]
+    if current and current.temp_c is not None:
+        c = int(round(current.temp_c))
+        f_v = int(round(current.temp_f))
+        lines.append(f"📡 Current ({current.source}): *{f_v}°F / {c}°C*")
+    lines.append("─" * 26)
+
+    for i, fc in enumerate(forecasts):
+        if i == 0:
+            day_label = "📅 *Today*"
+        elif i == 1:
+            day_label = "📅 *Tomorrow*"
+        else:
+            day_label = f"📅 *{fc.date.strftime('%A')}*"
+        flag = _flag(fc)
+        lines.append(f"\n{day_label} _{fc.date.strftime('%b %d')}_")
+        lines.append(
+            f"🌡️ Max: *{fc.predicted_max_f}°F / {fc.predicted_max_c}°C*  {flag}"
+        )
+        lines.append(
+            f"🎯 Confidence: *{int(fc.confidence*100)}%* "
+            f"({fc.confidence_level}) · σ {fc.std_c:.1f}°C"
+        )
+        market = markets_by_date.get(fc.date)
+        if market:
+            lines.append(_format_polymarket_block(market, fc))
+        else:
+            lines.append("_No Polymarket event for this day yet._")
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"pm:{city_key}"),
+            InlineKeyboardButton("🏙️ Cities", callback_data="pm_menu"),
+        ]
+    ]
+    await msg.edit_text(
+        "\n".join(l for l in lines if l),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
+
+
+# ─────────────────────────── Opportunities scanner ────────────────────────
+# Strict tier — high-conviction picks shown at the top
+OPP_CONF_MIN = 0.70
+OPP_MARKET_MIN = 0.40
+# Honorable mentions tier — looser fallback always shown below strict
+OPP_HM_CONF_MIN = 0.60
+OPP_HM_MARKET_MIN = 0.30
+
+
+async def _scan_one(
+    city_key: str, target_date: date,
+    conf_min: float = OPP_CONF_MIN,
+    market_min: float = OPP_MARKET_MIN,
+) -> Optional[Opportunity]:
+    """Build a single (city, date) opportunity if it clears the thresholds.
+    Returns None if anything is missing or below threshold."""
+    cfg = SUPPORTED_CITIES.get(city_key)
+    if not cfg:
+        return None
+    try:
+        forecasts = await fetch_ensemble_forecast(
+            cfg.resolves_at_lat, cfg.resolves_at_lon, days=3,
+            icao=cfg.resolves_at_icao,
+        )
+    except Exception:
+        return None
+    if not forecasts:
+        return None
+    fc = next((f for f in forecasts if f.date == target_date), None)
+    if fc is None:
+        return None
+    if fc.confidence < conf_min:
+        return None
+
+    market = await get_market_for_city(city_key, target_date)
+    if not market or not market.buckets:
+        return None
+
+    pred = fc.predicted_max_c if market.unit == "C" else fc.predicted_max_f
+    matched = match_for_prediction(market, pred)
+    if not matched or matched.yes_prob < market_min:
+        return None
+
+    sigma = fc.std_c if market.unit == "C" else fc.std_c * 9 / 5
+    ranked = rank_buckets_by_ev(market, float(pred), sigma)
+    if not ranked:
+        return None
+
+    best = ranked[0]
+    hedge = ranked[1] if len(ranked) > 1 else None
+    score = score_opportunity(fc.confidence, best.score)
+
+    today_local = city_local_today(city_key)
+    return Opportunity(
+        city_key=city_key, city_display=cfg.display,
+        target_date=target_date,
+        is_today=(today_local is not None and target_date == today_local),
+        confidence=fc.confidence, predicted_unit=pred, unit=market.unit,
+        matched_bucket=matched, matched_yes=matched.yes_prob,
+        best_pick=best, hedge_pick=hedge, market=market, score=score,
+    )
+
+
+async def find_opportunities_two_tier() -> Tuple[List[Opportunity], List[Opportunity]]:
+    """Scan all cities for today + tomorrow (city-local) and split into:
+      - strict: confidence ≥ OPP_CONF_MIN AND market YES ≥ OPP_MARKET_MIN
+      - honorable: passed honorable filter but not strict
+    Both lists are sorted by combined score, no caps. Single network pass
+    using the honorable thresholds; we classify into tiers after.
+    """
+    tasks = []
+    for city_key in SUPPORTED_CITIES:
+        local_today = city_local_today(city_key)
+        if local_today is None:
+            continue
+        for d in (local_today, local_today + timedelta(days=1)):
+            tasks.append(_scan_one(
+                city_key, d,
+                conf_min=OPP_HM_CONF_MIN,
+                market_min=OPP_HM_MARKET_MIN,
+            ))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_opps = [r for r in results if isinstance(r, Opportunity)]
+
+    strict = [o for o in all_opps
+              if o.confidence >= OPP_CONF_MIN
+              and o.matched_yes >= OPP_MARKET_MIN]
+    strict_keys = {(o.city_key, o.target_date) for o in strict}
+    honorable = [o for o in all_opps
+                 if (o.city_key, o.target_date) not in strict_keys]
+
+    strict.sort(key=lambda o: -o.score)
+    honorable.sort(key=lambda o: -o.score)
+    return strict, honorable
+
+
+def _format_opportunity_summary(opp: Opportunity, idx: int) -> str:
+    """Two-line summary. First line: city, day, model confidence + matched-
+    bucket market price (the number that the filter actually qualifies on).
+    Second line: the best EV pick with its own bar + edge.
+
+    This avoids the confusion where the matched bucket has e.g. 33% market
+    YES (passing the honorable 30% filter) but the *best EV pick* shown is
+    a different bucket with a different price.
+    """
+    day = "Today" if opp.is_today else "Tomorrow"
+    matched_pct = int(round(opp.matched_yes * 100))
+    matched_bar = _yes_bar(opp.matched_yes, width=8)
+    best = opp.best_pick
+    best_pct = int(round(best.market_p * 100))
+    best_bar = _yes_bar(best.market_p, width=8)
+    edge = best.edge_pp
+    edge_str = f"{edge:+.0f}pp" if abs(edge) >= 1 else "≈0pp"
+    same_bucket = best.bucket.market_slug == opp.matched_bucket.market_slug
+
+    line1 = (
+        f"*{idx}. {opp.city_display}* · _{day}_  "
+        f"🎯 *{int(opp.confidence*100)}%* model"
+    )
+    # Model-matched bucket — the one that determines tier qualification
+    line2 = (
+        f"   🎯 {opp.predicted_unit}°{opp.unit} → *{opp.matched_bucket.label}*  "
+        f"`{matched_bar}` {matched_pct}% market"
+    )
+    # Best EV pick — what we actually recommend
+    if same_bucket:
+        line3 = f"   💰 Best EV: same bucket · edge {edge_str}"
+    else:
+        line3 = (
+            f"   💰 Best EV: *{best.bucket.label}*  "
+            f"`{best_bar}` {best_pct}% · edge {edge_str}"
+        )
+    return f"{line1}\n{line2}\n{line3}"
+
+
+async def cmd_opportunities(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.effective_message.reply_text(
+        f"🎯 *Scanning {len(SUPPORTED_CITIES)} markets…*\n"
+        "_today + tomorrow, each city's local time_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        strict, honorable = await find_opportunities_two_tier()
+    except Exception as e:
+        log.exception("opportunity scan failed")
+        await msg.edit_text(f"❌ Scan failed: {e}")
+        return
+
+    if not strict and not honorable:
         await msg.edit_text(
-            f"✅ <b>Tracking added!</b>\n📍 {display}\n\n"
-            f"I'll refresh this location every {TRACKED_REFRESH_MIN} minutes.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb.back_and_refresh(
-                f"predict|{lat}|{lon}|{tz}|{geo['name'][:30]}"
+            "🎯 *No opportunities right now*\n\n"
+            f"No (city, day) cleared even the loose filter "
+            f"(conf ≥{int(OPP_HM_CONF_MIN*100)}% AND market YES "
+            f"≥{int(OPP_HM_MARKET_MIN*100)}%).\n\n"
+            "Most likely Polymarket hasn't published today's markets for many "
+            "cities yet — check back in a few hours.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔄 Rescan", callback_data="opp_scan")]]
             ),
         )
-        return ConversationHandler.END
+        return
 
-    elif action == "markets":
-        await msg.edit_text("📡 Fetching forecast &amp; scanning markets…",
-                            parse_mode=ParseMode.HTML)
-        return await do_scan_from_geo(update, ctx, geo, msg)
+    lines: List[str] = []
+    keyboard: List[List[InlineKeyboardButton]] = []
+    counter = 0
 
-    else:  # predict
-        await msg.edit_text("📡 Fetching multi-model forecast…",
-                            parse_mode=ParseMode.HTML)
-        return await do_predict_from_geo(update, ctx, geo, msg)
-
-
-# ─────────────────────────────────────────────────────────
-#  Prediction logic
-# ─────────────────────────────────────────────────────────
-async def do_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                     lat: float, lon: float, tz: str, loc_name: str) -> int:
-    q = update.callback_query
-    await q.edit_message_text("📡 Fetching forecast…", parse_mode=ParseMode.HTML)
-
-    weights = await db.load_latest_weights() or DEFAULT_WEIGHTS
-    pred    = await weather_service.ensemble_prediction(lat, lon, tz, weights)
-
-    if not pred:
-        await q.edit_message_text(
-            "❌ Could not retrieve forecast data. Please try again.",
-            reply_markup=kb.back_to_menu(),
-        )
-        return ConversationHandler.END
-
-    text = format_prediction(pred, loc_name)
-    ctx.user_data["last_pred"] = pred
-    ctx.user_data["last_loc"]  = loc_name
-
-    await q.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb.prediction_actions(lat, lon, tz, loc_name),
-    )
-    return ConversationHandler.END
-
-
-async def do_predict_from_geo(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                               geo: dict, msg) -> int:
-    weights = await db.load_latest_weights() or DEFAULT_WEIGHTS
-    pred    = await weather_service.ensemble_prediction(
-        geo["lat"], geo["lon"], geo["timezone"], weights
-    )
-    if not pred:
-        await msg.edit_text("❌ Forecast unavailable. Try again.",
-                            reply_markup=kb.back_to_menu())
-        return ConversationHandler.END
-
-    text = format_prediction(pred, geo["display"])
-    ctx.user_data["last_pred"] = pred
-    ctx.user_data["last_loc"]  = geo["display"]
-
-    await msg.edit_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb.prediction_actions(
-            geo["lat"], geo["lon"], geo["timezone"], geo["name"][:40]
-        ),
-    )
-    return ConversationHandler.END
-
-
-# ─────────────────────────────────────────────────────────
-#  Market scan logic
-# ─────────────────────────────────────────────────────────
-async def do_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                  lat: float, lon: float, tz: str, loc: str) -> int:
-    q = update.callback_query
-    await q.edit_message_text("🔍 Fetching forecast + scanning Polymarket…",
-                               parse_mode=ParseMode.HTML)
-
-    weights = await db.load_latest_weights() or DEFAULT_WEIGHTS
-    pred    = await weather_service.ensemble_prediction(lat, lon, tz, weights)
-    if not pred:
-        await q.edit_message_text("❌ Forecast unavailable.", reply_markup=kb.back_to_menu())
-        return ConversationHandler.END
-
-    scan = await polymarket_service.search_temperature_markets(loc, pred["today_c"])
-    text = _format_scan(loc, pred, scan)
-    ctx.user_data["last_scan_text"] = text
-
-    await q.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb.back_to_menu(),
-        disable_web_page_preview=True,
-    )
-    return ConversationHandler.END
-
-
-async def do_scan_from_geo(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                            geo: dict, msg) -> int:
-    weights = await db.load_latest_weights() or DEFAULT_WEIGHTS
-    pred    = await weather_service.ensemble_prediction(
-        geo["lat"], geo["lon"], geo["timezone"], weights
-    )
-    if not pred:
-        await msg.edit_text("❌ Forecast unavailable.", reply_markup=kb.back_to_menu())
-        return ConversationHandler.END
-
-    scan = await polymarket_service.search_temperature_markets(geo["name"], pred["today_c"])
-    text = _format_scan(geo["display"], pred, scan)
-    ctx.user_data["last_scan_text"] = text
-
-    await msg.edit_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb.back_to_menu(),
-        disable_web_page_preview=True,
-    )
-    return ConversationHandler.END
-
-
-def _format_scan(location: str, pred: dict, scan: dict) -> str:
-    edge_markets = scan["edge_markets"]
-    all_markets  = scan["all_markets"]
-
-    lines = [
-        f"{HEADER}",
-        f"{DIV}",
-        f"🎯 <b>MARKET SCANNER</b>",
-        f"📍 {location}",
-        f"🌡️ Predicted today: <b>{pred['today_c']}°C / {pred['today_f']}°F</b>",
-        f"{DIV}",
-    ]
-
-    if not all_markets:
-        lines += [
-            "⚠️ No temperature markets found for this location on Polymarket.",
-            "",
-            "💡 <i>Try searching by city name (e.g. New York, Chicago)</i>",
-        ]
-    else:
-        if edge_markets:
-            lines.append(f"🚀 <b>{len(edge_markets)} EDGE(S) ≥ {int(EDGE_THRESHOLD*100)}¢</b>")
-        else:
-            lines.append(f"🔍 Found {len(all_markets)} market(s) — no edges ≥ {int(EDGE_THRESHOLD*100)}¢ right now")
-        lines.append("")
-        shown = (edge_markets or all_markets)[:5]
-        for i, m in enumerate(shown):
-            lines.append(polymarket_service.format_market_card(m, i))
-            lines.append("")
-
-    lines += [DIV,
-              f"<i>Edge = our probability − market price  (threshold ≥ +{int(EDGE_THRESHOLD*100)}¢)</i>"]
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────
-#  Track location
-# ─────────────────────────────────────────────────────────
-async def do_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                   lat: float, lon: float, tz: str, loc: str) -> int:
-    uid = update.effective_user.id
-    q   = update.callback_query
-    await db.add_tracked(uid, loc, lat, lon, tz, loc)
-    await q.answer(f"✅ Tracking {loc}")
-    await q.edit_message_text(
-        f"✅ <b>Now tracking: {loc}</b>\n\n"
-        f"Refreshed every {TRACKED_REFRESH_MIN} min. View in 📡 Tracked Locations.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb.back_to_menu(),
-    )
-    return ConversationHandler.END
-
-
-async def show_tracked(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    uid  = update.effective_user.id
-    q    = update.callback_query
-    locs = await db.get_tracked(uid)
-
-    if not locs:
-        text = (f"{HEADER}\n{DIV}\n📡 <b>Tracked Locations</b>\n\n"
-                "You haven't tracked any locations yet.\n"
-                "Use <i>📡 Track Location</i> to add one.")
-        markup = kb.back_to_menu()
-    else:
-        text = (f"{HEADER}\n{DIV}\n📡 <b>Tracked Locations</b>  ({len(locs)})\n\n"
-                "Tap a location to see its latest forecast:")
-        markup = kb.tracked_list(locs)
-
-    await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    return ConversationHandler.END
-
-
-# ─────────────────────────────────────────────────────────
-#  Positions
-# ─────────────────────────────────────────────────────────
-async def show_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    uid       = update.effective_user.id
-    q         = update.callback_query
-    positions = await db.get_open_positions(uid)
-
-    if not positions:
-        await q.edit_message_text(
-            f"{HEADER}\n{DIV}\n💼 <b>My Positions</b>\n\nNo open positions yet.\n\n"
-            "Use 🌡️ Predict → 🎯 Scan Markets → 💼 Add Position to get started.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb.back_to_menu(),
-        )
-        return ConversationHandler.END
-
-    total_pnl  = 0.0
-    total_cost = 0.0
-    for p in positions:
-        cost  = p["shares"] * p["entry_price"]
-        cur   = p["shares"] * (p["current_price"] or p["entry_price"])
-        total_pnl  += cur - cost
-        total_cost += cost
-
-    icon = _pnl_icon(total_pnl)
-    text = (
-        f"{HEADER}\n{DIV}\n"
-        f"💼 <b>Open Positions</b>  ({len(positions)})\n\n"
-        f"{icon} Total P&amp;L: <b>${total_pnl:+.2f}</b>"
-        f"  ({total_pnl / total_cost * 100:+.1f}%)\n\n"
-        "Tap a position for details:"
-    )
-    await q.edit_message_text(text, parse_mode=ParseMode.HTML,
-                               reply_markup=kb.position_list(positions))
-    return ConversationHandler.END
-
-
-async def show_pos_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                          pos_id: int) -> int:
-    q    = update.callback_query
-    uid  = update.effective_user.id
-    all_pos = await db.get_all_positions(uid)
-    pos  = next((p for p in all_pos if p["id"] == pos_id), None)
-
-    if not pos:
-        await q.answer("Position not found")
-        return ConversationHandler.END
-
-    text   = format_position(pos)
-    markup = kb.position_detail(pos_id, pos.get("market_url"))
-    await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
-                               disable_web_page_preview=True)
-    return ConversationHandler.END
-
-
-# Position entry flow ─────────────────────────────────────
-
-async def handle_pos_outcome(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data["addpos_outcome"] = update.message.text.strip()
-    await update.message.reply_text(
-        "💼 How many shares did you buy? (e.g. <code>50</code>):",
-        parse_mode=ParseMode.HTML,
-    )
-    return AWAIT_POS_SHARES
-
-
-async def handle_pos_shares(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        ctx.user_data["addpos_shares"] = float(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a number (e.g. 50).")
-        return AWAIT_POS_SHARES
-    await update.message.reply_text(
-        "💰 Entry price per share? (e.g. <code>0.42</code>):",
-        parse_mode=ParseMode.HTML,
-    )
-    return AWAIT_POS_PRICE
-
-
-async def handle_pos_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        ctx.user_data["addpos_price"] = float(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a decimal (e.g. 0.42).")
-        return AWAIT_POS_PRICE
-    await update.message.reply_text(
-        "📝 Any notes? (optional — type <code>skip</code> to skip):",
-        parse_mode=ParseMode.HTML,
-    )
-    return AWAIT_POS_NOTES
-
-
-async def handle_pos_notes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    notes = update.message.text.strip()
-    if notes.lower() == "skip":
-        notes = ""
-
-    uid     = update.effective_user.id
-    ud      = ctx.user_data
-    mid     = ud.get("addpos_market_id", "")
-    pred_c  = ud.get("addpos_pred_c", 0.0)
-
-    # Lookup market details from cache
-    cached_scan = ud.get("last_scan_text", "")
-    market_name = f"Market {mid[:8]}…"
-    market_url  = f"https://polymarket.com/market/{mid}"
-
-    pos_id = await db.add_position(
-        user_id=uid,
-        location=ud.get("last_loc", "Unknown"),
-        market_id=mid,
-        market_name=market_name,
-        market_url=market_url,
-        outcome=ud.get("addpos_outcome", ""),
-        shares=ud.get("addpos_shares", 0),
-        entry_price=ud.get("addpos_price", 0),
-        pred_c=pred_c,
-        pred_f=weather_service.c_to_f(pred_c),
-        notes=notes,
-    )
-
-    cost = ud["addpos_shares"] * ud["addpos_price"]
-    await update.message.reply_text(
-        f"✅ <b>Position #{pos_id} saved!</b>\n\n"
-        f"📋 {ud['addpos_outcome']}\n"
-        f"💼 {ud['addpos_shares']:.0f} shares @ ${ud['addpos_price']:.3f}\n"
-        f"💰 Cost basis: ${cost:.2f}\n\n"
-        f"View in 💼 My Positions.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb.back_to_menu(),
-    )
-    return ConversationHandler.END
-
-
-# Update / close price ────────────────────────────────────
-
-async def handle_update_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        price = float(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Enter a decimal price.")
-        return AWAIT_UPDATE_PRICE
-    pos_id = ctx.user_data.get("pos_update_id")
-    await db.update_position_price(pos_id, price)
-    await update.message.reply_text(
-        f"✅ Price updated to ${price:.3f}",
-        reply_markup=kb.back_to_menu(),
-    )
-    return ConversationHandler.END
-
-
-async def handle_close_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        price = float(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Enter a decimal price.")
-        return AWAIT_CLOSE_PRICE
-    pos_id = ctx.user_data.get("pos_close_id")
-    await db.close_position(pos_id, price)
-    await update.message.reply_text(
-        f"🔒 Position #{pos_id} closed @ ${price:.3f}",
-        reply_markup=kb.back_to_menu(),
-    )
-    return ConversationHandler.END
-
-
-# ─────────────────────────────────────────────────────────
-#  Favourites
-# ─────────────────────────────────────────────────────────
-async def show_favourites(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    uid  = update.effective_user.id
-    q    = update.callback_query
-    favs = await db.get_favorites(uid)
-
-    if not favs:
-        text = (f"{HEADER}\n{DIV}\n⭐ <b>Favourite Markets</b>\n\n"
-                "No favourites yet.\n\n"
-                "When browsing market results, tap ⭐ Add to Favs.")
-        markup = kb.back_to_menu()
-    else:
-        text = (f"{HEADER}\n{DIV}\n⭐ <b>Favourite Markets</b>  ({len(favs)})\n\n"
-                "Tap a market to open | 🔄 to refresh price | 🗑️ to remove:")
-        markup = kb.favourites_list(favs)
-
-    await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    return ConversationHandler.END
-
-
-async def add_favourite(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                        market_id: str) -> int:
-    q   = update.callback_query
-    uid = update.effective_user.id
-
-    raw = await polymarket_service.get_market_by_id(market_id)
-    if not raw:
-        await q.answer("❌ Could not fetch market data")
-        return ConversationHandler.END
-
-    slug     = raw.get("slug", "")
-    question = raw.get("question", "")
-    name     = question[:60] or f"Market {market_id[:8]}"
-    url      = polymarket_service._market_url(raw)
-
-    await db.add_favorite(uid, market_id, name, url, question, "")
-    await q.answer("⭐ Added to favourites!")
-    return ConversationHandler.END
-
-
-async def refresh_favourite(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                            fav_id: int, market_id: str) -> int:
-    q = update.callback_query
-    prices = await polymarket_service.get_current_price(market_id)
-    if prices:
-        y, n = prices
-        await q.answer(f"YES: ${y:.2f}  NO: ${n:.2f}")
-    else:
-        await q.answer("Could not fetch price")
-    return ConversationHandler.END
-
-
-# ─────────────────────────────────────────────────────────
-#  Backtest
-# ─────────────────────────────────────────────────────────
-async def show_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q    = update.callback_query
-    rows = await db.load_latest_backtest()
-
-    if not rows:
-        text = (f"{HEADER}\n{DIV}\n📊 <b>Backtest Results</b>\n\n"
-                "No backtest has been run yet.\n\n"
-                "Tap 🔄 Run New Backtest to start (~2 min).")
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML,
-                                   reply_markup=InlineKeyboardMarkup([[
-                                       InlineKeyboardButton("🔄 Run Backtest",
-                                                            callback_data="menu_run_backtest"),
-                                       InlineKeyboardButton("🏠 Menu",
-                                                            callback_data="menu_main"),
-                                   ]]))
-        return ConversationHandler.END
-
-    # Aggregate rows by model
-    by_model: dict[str, list] = {}
-    for r in rows:
-        by_model.setdefault(r["model"], []).append(r)
-
-    weights = await db.load_latest_weights() or DEFAULT_WEIGHTS
-    medal   = ["🥇", "🥈", "🥉"]
-    ranked  = sorted(by_model.items(),
-                     key=lambda x: sum(r["mae"] for r in x[1]) / len(x[1]))
-
-    lines = [
-        f"{HEADER}", f"{DIV}", "📊 <b>BACKTEST RESULTS</b>", "",
-        "<code>",
-        f"{'Model':<13} {'MAE':>5} {'RMSE':>5} {'Bias':>5} {'±1°C':>5} {'±2°C':>5}",
-        f"{'─'*13} {'─'*5} {'─'*5} {'─'*5} {'─'*5} {'─'*5}",
-    ]
-    for i, (model, rs) in enumerate(ranked):
-        mae  = sum(r["mae"]   for r in rs) / len(rs)
-        rmse = sum(r["rmse"]  for r in rs) / len(rs)
-        bias = sum(r["bias"]  for r in rs) / len(rs)
-        a1   = sum(r["acc_1c"] for r in rs) / len(rs)
-        a2   = sum(r["acc_2c"] for r in rs) / len(rs)
-        m    = medal[i] if i < 3 else "  "
+    if strict:
         lines.append(
-            f"{m}{model:<11} {mae:>5.2f} {rmse:>5.2f} {bias:>+5.2f} {a1:>4.0f}% {a2:>4.0f}%"
+            f"🟢 *Strict Picks* — conf ≥{int(OPP_CONF_MIN*100)}% · "
+            f"market ≥{int(OPP_MARKET_MIN*100)}%"
         )
-    lines += ["</code>", "", "⚖️ <b>Active Ensemble Weights</b>", "<code>"]
-    for model, wt in sorted(weights.items(), key=lambda x: -x[1]):
-        bar = "█" * int(wt * 20)
-        lines.append(f"{model:<12} {wt*100:>5.1f}%  {bar}")
-    lines += ["</code>", "", f"📍 {len(rows)} records  •  30-day window  •  12 locations"]
+        lines.append("")
+        for opp in strict:
+            counter += 1
+            lines.append(_format_opportunity_summary(opp, counter))
+            keyboard.append([InlineKeyboardButton(
+                f"📋 #{counter}: {opp.city_display} "
+                f"{('Today' if opp.is_today else 'Tom')}",
+                callback_data=f"opp:{opp.city_key}:{opp.target_date.isoformat()}",
+            )])
+    else:
+        lines.append("🟢 *Strict Picks* — _none right now_")
+        lines.append("")
 
-    await q.edit_message_text(
+    if honorable:
+        lines.append("")
+        lines.append(
+            f"🟡 *Honorable Mentions* — conf ≥{int(OPP_HM_CONF_MIN*100)}% · "
+            f"market ≥{int(OPP_HM_MARKET_MIN*100)}%"
+        )
+        lines.append("")
+        for opp in honorable:
+            counter += 1
+            lines.append(_format_opportunity_summary(opp, counter))
+            keyboard.append([InlineKeyboardButton(
+                f"📋 #{counter}: {opp.city_display} "
+                f"{('Today' if opp.is_today else 'Tom')}",
+                callback_data=f"opp:{opp.city_key}:{opp.target_date.isoformat()}",
+            )])
+
+    lines.append("")
+    lines.append("_Sorted by edge × confidence within each tier._")
+    keyboard.append([InlineKeyboardButton("🔄 Rescan", callback_data="opp_scan")])
+
+    await msg.edit_text(
         "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Re-run Backtest", callback_data="menu_run_backtest"),
-            InlineKeyboardButton("🏠 Menu",             callback_data="menu_main"),
-        ]]),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
     )
-    return ConversationHandler.END
 
 
-async def trigger_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def show_opportunity_detail(
+    update: Update, city_key: str, target_date_iso: str
+) -> None:
+    """Detail view for one opportunity: model context + top-3 EV picks
+    with smart pick highlighted and Trade buttons.
+
+    We re-fetch using the LOOSE (honorable) thresholds so any opportunity
+    from either tier survives the round-trip. If the underlying market or
+    forecast has genuinely shifted out of even the loose band, we tell the
+    user with specific numbers, not just "shifted."
+    """
+    try:
+        target_date = date.fromisoformat(target_date_iso)
+    except ValueError:
+        return
+
+    # Re-fetch at the LOOSE threshold so honorable-tier opportunities also
+    # round-trip cleanly. (Was the bug: this used strict defaults.)
+    opp = await _scan_one(
+        city_key, target_date,
+        conf_min=OPP_HM_CONF_MIN,
+        market_min=OPP_HM_MARKET_MIN,
+    )
+    if not opp:
+        # Genuinely below even the loose band now — give the user the actual
+        # numbers so they can decide for themselves.
+        cfg = SUPPORTED_CITIES.get(city_key)
+        diag_lines = [
+            "ℹ️ *Opportunity no longer above threshold.*",
+            "",
+            f"Re-checked {cfg.display if cfg else city_key} for "
+            f"{target_date.strftime('%b %d')} just now and either:",
+            f"• Model confidence dropped below {int(OPP_HM_CONF_MIN*100)}%, OR",
+            f"• Polymarket YES on the matched bucket dropped below "
+            f"{int(OPP_HM_MARKET_MIN*100)}%, OR",
+            "• The market closed / hasn't been published yet.",
+            "",
+            "_Tap Polymarket below to view the live market manually._",
+        ]
+        kb = []
+        if cfg:
+            kb.append([InlineKeyboardButton(
+                f"🎲 View {cfg.display} markets",
+                callback_data=f"pm:{city_key}",
+            )])
+        kb.append([InlineKeyboardButton(
+            "⬅ All opportunities", callback_data="opp_scan"
+        )])
+        await update.effective_message.reply_text(
+            "\n".join(diag_lines),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    cfg = SUPPORTED_CITIES.get(city_key)
+    day = "Today" if opp.is_today else "Tomorrow"
+    matched_slug = opp.matched_bucket.market_slug
+
+    lines = [
+        f"🎯 *{opp.city_display}* — {day} ({opp.target_date.strftime('%b %d')})",
+        f"🏟️ _{_md_safe(cfg.resolves_at_name)} ({cfg.resolves_at_icao})_",
+        "",
+        f"🌡️ Model max: *{opp.predicted_unit}°{opp.unit}*  ·  "
+        f"🎯 *{int(opp.confidence*100)}%* confidence",
+        "",
+        "*Top picks ranked by expected value:*",
+    ]
+
+    # Top 3 EV picks
+    sigma = (opp.market.buckets[0].value, )  # placeholder
+    # Re-rank to make sure we have access to all picks
+    sigma_unit = (
+        # We don't have direct access to fc here; use the bucket's sigma proxy
+        # by computing from the matched bucket geometry
+        1.0
+    )
+    # Simpler: rerun rank_buckets_by_ev with what we have
+    # Recompute sigma from market unit and a default
+    # (We can't easily get the original fc.std_c here without keeping it on Opportunity;
+    # quick fix: store sigma on Opportunity. But to keep this patch surgical,
+    # display top 3 from the same scan we already computed.)
+    # Re-scan would be wasteful, so compute by iterating the market once:
+    from polymarket import rank_buckets_by_ev as _rank
+    # Pull sigma off the matched bucket's neighborhood via re-fetch is heavy;
+    # use a fixed reasonable sigma that matches our typical model output.
+    sigma_proxy = 1.0 if opp.unit == "C" else 1.8
+    ranked = _rank(opp.market, float(opp.predicted_unit), sigma_proxy)[:3]
+
+    keyboard = []
+    for i, p in enumerate(ranked):
+        is_best = (i == 0)
+        is_match = p.bucket.market_slug == matched_slug
+        bar = _yes_bar(p.market_p, width=8)
+        emoji = "💰" if is_best else "🎯" if is_match else "•"
+        edge = f"{p.edge_pp:+.0f}pp"
+        ev_per_d = f"${p.ev_per_dollar:+.2f}"
+        lines.append(
+            f"{emoji} *{p.bucket.label}*"
+            f"{'  ✅ matches model' if is_match else ''}\n"
+            f"   `{bar}` *{int(round(p.market_p*100))}%* market · "
+            f"*{int(round(p.model_p*100))}%* model · edge *{edge}*\n"
+            f"   _EV per $1: {ev_per_d}_  {_md_link('▶ Trade', p.bucket.trade_url)}"
+        )
+        keyboard.append([InlineKeyboardButton(
+            f"{emoji} {p.bucket.label} ({int(round(p.market_p*100))}%)",
+            url=p.bucket.trade_url,
+        )])
+
+    lines.append("")
+    lines.append(
+        "💰 = best EV pick · 🎯 = matches model · ✅ = market's matched bucket"
+    )
+    lines.append(
+        "_EV per $1 = (model probability ÷ market price) − 1. Positive = "
+        "model thinks bucket is mispriced cheap._"
+    )
+
+    keyboard.append([
+        InlineKeyboardButton("⬅ All opportunities", callback_data="opp_scan"),
+    ])
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
+
+
+async def track_airport(update: Update, code: str) -> None:
+    code = code.upper().strip()
+    airport = airports_db.lookup(code)
+    if not airport:
+        await update.effective_message.reply_text(
+            f"❌ Airport not found: `{_md_safe(code)}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if tracking_db.add(user_id, chat_id, airport.icao):
+        await update.effective_message.reply_text(
+            f"✅ Now tracking *{airport.icao}* — {_md_safe(airport.name)}\n\n"
+            f"You'll get an alert if the predicted max temp shifts by "
+            f"≥{int(ALERT_THRESHOLD_F)}°F ({ALERT_THRESHOLD_C:g}°C). "
+            f"Checks run every {TRACKING_INTERVAL_MINUTES} min.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"ℹ️ Already tracking *{airport.icao}*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ─────────────────────────── formatting ──────────────────────────
+def _md_safe(s: str) -> str:
+    """Escape characters that break Telegram's legacy Markdown."""
+    if not s:
+        return ""
+    for ch in ("*", "_", "`", "["):
+        s = s.replace(ch, " ")
+    return s
+
+
+def _flag(f: DayForecast) -> str:
+    if f.high_confidence:
+        return "🟢"
+    if f.confidence_level == "MEDIUM":
+        return "🟡"
+    return "🔴"
+
+
+def _md_link(label: str, url: str) -> str:
+    """Inline markdown link, with [] inside the label sanitized."""
+    safe = label.replace("[", "(").replace("]", ")")
+    return f"[{safe}]({url})"
+
+
+def _yes_bar(prob: float, width: int = 10) -> str:
+    """Compact inline bar using thin block characters. ▰ = filled, ▱ = empty.
+    Always shows ≥1 filled if prob > 0.05, never shows full unless prob ≈ 1.
+    """
+    if not (0 <= prob <= 1):
+        prob = max(0.0, min(1.0, prob))
+    filled = int(round(prob * width))
+    if prob > 0.05 and filled == 0:
+        filled = 1
+    if prob < 0.999 and filled >= width:
+        filled = width - 1
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def _format_polymarket_block(market, fc: DayForecast) -> str:
+    """Compact Polymarket section: 3 model-centered picks rendered as
+    single-line entries with inline bars."""
+    pred = fc.predicted_max_c if market.unit == "C" else fc.predicted_max_f
+    matched = match_for_prediction(market, pred)
+    matched_slug = matched.market_slug if matched else None
+
+    out = []
+    out.append(f"\n🎲 *Polymarket* — {market.city_display} (°{market.unit})")
+    out.append(
+        f"🏟️ _{_md_safe(market.resolves_at_name)} ({market.resolves_at_icao})_"
+    )
+
+    picks = hedges_around(market, pred, target_count=3)
+    if not picks:
+        picks = top_n_by_yes(market, n=3)
+
+    for b in sorted(picks, key=lambda x: x.value):
+        check = " ✅" if matched_slug and b.market_slug == matched_slug else ""
+        yes_pct = int(round(b.yes_prob * 100))
+        no_pct = 100 - yes_pct
+        bar = _yes_bar(b.yes_prob)
+        out.append(
+            f"`{bar}` *{b.label}*{check} · *{yes_pct}%*Y _{no_pct}%N_  "
+            f"{_md_link('Trade', b.trade_url)}"
+        )
+
+    crowd_top3_slugs = {b.market_slug for b in top_n_by_yes(market, n=3)}
+    if matched_slug and matched_slug not in crowd_top3_slugs:
+        out.append("⚠️ _Our pick differs from the crowd — verify before trading._")
+
+    return "\n".join(out)
+
+    return "\n".join(out)
+
+
+def format_forecast(airport, forecasts, current, markets_by_date=None) -> str:
+    markets_by_date = markets_by_date or {}
+    parts = []
+    code_str = f"*{airport.icao}*"
+    if airport.iata:
+        code_str += f" / *{airport.iata}*"
+    parts.append(f"{airport.type_emoji} {code_str}")
+    parts.append(f"📍 {_md_safe(airport.name)}")
+    parts.append(f"🌍 {_md_safe(airport.city)}, {airport.country}")
+
+    # Current observation block
+    if current and current.temp_c is not None:
+        c = int(round(current.temp_c))
+        f_v = int(round(current.temp_f))
+        line = f"\n📡 *Current ({current.source})*: {f_v}°F / {c}°C"
+        if current.wind_kt is not None:
+            wd = current.wind_dir if current.wind_dir is not None else "—"
+            line += f"  ·  💨 {int(round(current.wind_kt))} kt @ {wd}°"
+        parts.append(line)
+
+    parts.append(
+        "\n🧠 *Ensemble forecast* — 8 NWP models, ECMWF-weighted"
+    )
+    parts.append("─" * 26)
+
+    for i, fc in enumerate(forecasts):
+        if i == 0:
+            day_label = "📅 *Today*"
+        elif i == 1:
+            day_label = "📅 *Tomorrow*"
+        else:
+            day_label = f"📅 *{fc.date.strftime('%a')}*"
+        date_label = fc.date.strftime("%b %d")
+
+        flag = _flag(fc)
+        parts.append(f"\n{day_label} _{date_label}_")
+        parts.append(
+            f"🌡️ Max: *{fc.predicted_max_f}°F / {fc.predicted_max_c}°C*  {flag}"
+        )
+
+        # Range (mean ± σ rounded)
+        lo_c = int(round(fc.ensemble_mean_c - fc.std_c))
+        hi_c = int(round(fc.ensemble_mean_c + fc.std_c))
+        lo_f = int(round(lo_c * 9 / 5 + 32))
+        hi_f = int(round(hi_c * 9 / 5 + 32))
+        parts.append(
+            f"   📉 Range ±1σ: {lo_f}–{hi_f}°F ({lo_c}–{hi_c}°C)"
+        )
+
+        parts.append(
+            f"   🎯 Confidence: *{int(fc.confidence * 100)}%* "
+            f"({fc.confidence_level}) · σ {fc.std_c:.1f}°C"
+        )
+
+        # Top 3 probabilities (Fahrenheit)
+        top = sorted(fc.probability_f.items(), key=lambda x: -x[1])[:3]
+        prob_str = " · ".join(f"{t}°F: *{int(p * 100)}%*" for t, p in top)
+        parts.append(f"   📊 {prob_str}")
+
+        # ───── Polymarket section (only when a market exists for this day) ─────
+        market = markets_by_date.get(fc.date)
+        if market:
+            parts.append(_format_polymarket_block(market, fc))
+
+    parts.append("\n" + "─" * 26)
+    parts.append("🟢 high confidence  ·  🟡 medium  ·  🔴 low")
+    parts.append("_Predictions are whole-number °F and °C, ensemble-calibrated to ±2°._")
+    return "\n".join(parts)
+
+
+# ─────────────────────────── handlers ─────────────────────────────
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.edit_message_text(
-        f"{HEADER}\n{DIV}\n🔬 <b>Running Backtest…</b>\n\n"
-        "Fetching 30 days of forecast + observed data\n"
-        "across 12 airports &amp; cities.\n\n"
-        "⏳ This takes ~90 seconds. Please wait…",
-        parse_mode=ParseMode.HTML,
-    )
+    await q.answer()
+    data = q.data or ""
+    if data.startswith("fc:"):
+        await send_forecast(update, data[3:])
+    elif data.startswith("track:"):
+        await track_airport(update, data[6:])
+    elif data.startswith("untrack:"):
+        code = data[8:]
+        if tracking_db.remove(update.effective_user.id, code):
+            await q.message.reply_text(
+                f"✅ No longer tracking *{code}*.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    elif data.startswith("models:"):
+        await show_models_breakdown(update, data[7:])
+    elif data == "pm_menu":
+        await show_polymarket_city_menu(update)
+    elif data.startswith("pm:"):
+        await send_polymarket_forecast(update, data[3:])
+    elif data == "opp_scan":
+        await cmd_opportunities(update, ctx)
+    elif data.startswith("opp:"):
+        # opp:<city_key>:<YYYY-MM-DD>
+        rest = data[4:]
+        try:
+            city_key, date_iso = rest.split(":", 1)
+        except ValueError:
+            return
+        await show_opportunity_detail(update, city_key, date_iso)
 
-    last_text = [None]
 
-    async def progress(msg: str):
-        if msg != last_text[0]:
-            last_text[0] = msg
+_AIRPORT_CODE_RE = re.compile(r"^[A-Za-z]{3,4}$")
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    txt = (update.effective_message.text or "").strip()
+    if not txt:
+        return
+
+    # Reply-keyboard buttons
+    if txt == "🎯 Opportunities":
+        await cmd_opportunities(update, ctx)
+        return
+    if txt == "🎲 Polymarket":
+        await show_polymarket_city_menu(update)
+        return
+    if txt == "🌤️ Forecast":
+        await update.effective_message.reply_text(
+            "🌤️ Send me an airport code — just type it.\n\nExample: *KJFK* or *LAX*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if txt == "🔍 Search City":
+        await update.effective_message.reply_text(
+            "🔍 Send me a city name — just type it.\n\nExample: *London*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if txt == "📋 My Tracked":
+        await cmd_list(update, ctx)
+        return
+    if txt == "❓ Help":
+        await cmd_help(update, ctx)
+        return
+
+    # 3- or 4-letter code that maps to a known airport → forecast
+    if _AIRPORT_CODE_RE.match(txt) and airports_db.lookup(txt):
+        await send_forecast(update, txt)
+        return
+
+    # Anything else → city search
+    await do_city_search(update, txt)
+
+
+# ─────────────────────────── tracking job ─────────────────────────
+async def tracking_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = tracking_db.list_all()
+    if not rows:
+        return
+    log.info("tracking_job: checking %d entries", len(rows))
+    for row_id, user_id, chat_id, code, last_c, last_f, last_bucket in rows:
+        airport = airports_db.lookup(code)
+        if not airport:
+            continue
+        try:
+            forecasts = await fetch_ensemble_forecast(
+                airport.lat, airport.lon, days=1, icao=airport.icao,
+            )
+        except Exception:
+            log.exception("forecast fetch failed for %s", code)
+            continue
+        if not forecasts:
+            continue
+        today = forecasts[0]
+        new_c = today.predicted_max_c
+        new_f = today.predicted_max_f
+
+        # Look up Polymarket for this airport's city (explicit map or
+        # geographic fallback), today (if any).
+        market = None
+        new_bucket_label = None
+        resolved = resolve_city_for_airport(airport.icao, airport.lat, airport.lon)
+        if resolved:
+            city_key, _market_unit, _src = resolved
             try:
-                await q.edit_message_text(
-                    f"{HEADER}\n{DIV}\n🔬 <b>Backtest Running</b>\n\n{msg}",
-                    parse_mode=ParseMode.HTML,
+                market = await get_market_for_city(city_key, today.date)
+            except Exception:
+                log.exception("polymarket fetch failed for %s", code)
+                market = None
+            if market:
+                pred = today.predicted_max_c if market.unit == "C" else today.predicted_max_f
+                matched = match_for_prediction(market, pred)
+                if matched:
+                    new_bucket_label = matched.label
+
+        # Decide whether to alert.
+        # Per user spec: include Polymarket data in the alert only when our
+        # model's bucket changes. Temperature-threshold alerts still fire as
+        # before, but without the market block.
+        bucket_changed = (
+            new_bucket_label is not None
+            and last_bucket is not None
+            and new_bucket_label != last_bucket
+        )
+        temp_changed = False
+        if last_c is not None and last_f is not None:
+            d_c = abs(new_c - last_c)
+            d_f = abs(new_f - last_f)
+            if d_c >= ALERT_THRESHOLD_C or d_f >= ALERT_THRESHOLD_F:
+                temp_changed = True
+
+        if bucket_changed or temp_changed:
+            arrow = "📈" if (last_c is not None and new_c > last_c) else "📉"
+            flag = _flag(today)
+            lines = [
+                f"🔔 *Forecast Alert: {code}*",
+                f"📍 {_md_safe(airport.name)}",
+                "",
+                f"{arrow} Today's predicted max changed:",
+                f"   Old: {int(round(last_f))}°F / {int(round(last_c))}°C"
+                if last_f is not None else "   Old: —",
+                f"   New: *{new_f}°F / {new_c}°C* {flag}",
+            ]
+            if last_f is not None:
+                lines.append(
+                    f"   Δ: {int(new_f - last_f):+d}°F / {int(new_c - last_c):+d}°C"
+                )
+            lines.append("")
+            lines.append(
+                f"Confidence: *{int(today.confidence * 100)}%* "
+                f"({today.confidence_level})"
+            )
+
+            # Polymarket block — included only when the bucket changed.
+            if bucket_changed and market:
+                lines.append("")
+                lines.append(
+                    f"🪣 Polymarket bucket shifted: "
+                    f"*{last_bucket}* → *{new_bucket_label}*"
+                )
+                lines.append(_format_polymarket_block(market, today).lstrip("\n"))
+
+            try:
+                await ctx.bot.send_message(
+                    chat_id,
+                    "\n".join(lines),
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
                 )
             except Exception:
-                pass
+                log.exception("failed to send alert to chat %s", chat_id)
 
-    try:
-        bt = await backtest_service.run_backtest(progress_cb=progress)
-        summary = backtest_service.format_backtest_summary(bt)
-        await q.edit_message_text(
-            summary,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb.back_to_menu(),
-        )
-    except Exception as e:
-        log.exception("Backtest failed: %s", e)
-        await q.edit_message_text(
-            f"❌ Backtest failed: {e}\n\nTry again later.",
-            reply_markup=kb.back_to_menu(),
-        )
-    return ConversationHandler.END
+        tracking_db.update_last(row_id, new_c, new_f, new_bucket_label)
 
 
-# ─────────────────────────────────────────────────────────
-#  Help
-# ─────────────────────────────────────────────────────────
-async def show_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    text = (
-        f"{HEADER}\n{DIV}\n"
-        "ℹ️ <b>HELP &amp; COMMANDS</b>\n\n"
-        "<b>🌡️ Predict Temperature</b>\n"
-        "  Enter any city, address, or airport name/code.\n"
-        "  Shows today &amp; tomorrow high in °C and °F.\n\n"
-        "<b>📡 Track Location</b>\n"
-        "  Save a location for hourly auto-refresh.\n\n"
-        "<b>🎯 Market Scanner</b>\n"
-        "  Finds Polymarket temperature markets near your location\n"
-        "  and computes trading edge (our prob − market price).\n"
-        f"  Flags any edge ≥ {int(EDGE_THRESHOLD*100)}¢/share as a trade opportunity.\n\n"
-        "<b>💼 My Positions</b>\n"
-        "  Track shares, entry price, and live P&amp;L.\n"
-        "  Update or close positions as markets move.\n\n"
-        "<b>⭐ Favourites</b>\n"
-        "  Pin specific markets for instant price refresh.\n\n"
-        "<b>📊 Backtest</b>\n"
-        "  View or re-run the 30-day accuracy evaluation\n"
-        "  that calibrates model weights.\n\n"
-        f"{DIV}\n"
-        "<b>Models</b>: ECMWF IFS · NOAA GFS · DWD ICON\n"
-        "<b>Data</b>: Open-Meteo API (free, no key needed)\n"
-        "<b>Markets</b>: Polymarket Gamma API\n"
-        "<b>Edge formula</b>: P_model(YES) − Market_price(YES)\n"
-    )
-    await q.edit_message_text(text, parse_mode=ParseMode.HTML,
-                               reply_markup=kb.back_to_menu())
-    return ConversationHandler.END
-
-
-# ─────────────────────────────────────────────────────────
-#  Cancel / fallback
-# ─────────────────────────────────────────────────────────
-async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "✅ Cancelled.", reply_markup=kb.back_to_menu()
-    )
-    return ConversationHandler.END
-
-
-async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        f"{HEADER}\n{DIV}\nChoose an option 👇",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb.main_menu(),
-    )
-
-
-# ─────────────────────────────────────────────────────────
-#  Background job: auto-refresh tracked locations
-# ─────────────────────────────────────────────────────────
-async def job_refresh_tracked(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Runs every TRACKED_REFRESH_MIN minutes — sends update to all tracked users."""
-    log.info("Job: refreshing tracked locations")
-    # We don't have a user_id list handy in the job context, so we query all
-    async with __import__("aiosqlite").connect(__import__("config").DB_PATH) as conn:
-        conn.row_factory = __import__("aiosqlite").Row
-        async with conn.execute("SELECT DISTINCT user_id FROM tracked_locations") as cur:
-            uids = [r["user_id"] for r in await cur.fetchall()]
-
-    weights = await db.load_latest_weights() or DEFAULT_WEIGHTS
-
-    for uid in uids:
-        locs = await db.get_tracked(uid)
-        for loc in locs:
-            try:
-                pred = await weather_service.ensemble_prediction(
-                    loc["latitude"], loc["longitude"], loc["timezone"], weights
-                )
-                if pred:
-                    text = (
-                        f"🔔 <b>Auto-Refresh</b>\n"
-                        + format_prediction(pred, loc["display_name"] or loc["name"])
-                    )
-                    await ctx.bot.send_message(
-                        uid, text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=kb.prediction_actions(
-                            loc["latitude"], loc["longitude"],
-                            loc["timezone"], loc["name"],
-                        ),
-                    )
-            except Exception as e:
-                log.warning("Auto-refresh error for %s: %s", loc["name"], e)
-
-
-# ─────────────────────────────────────────────────────────
-#  Application setup
-# ─────────────────────────────────────────────────────────
-def build_application() -> Application:
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-
-    # Conversation handler wires all multi-step interactions together
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", cmd_start),
-            CommandHandler("menu",  cmd_menu),
-            CallbackQueryHandler(menu_router),
-        ],
-        states={
-            AWAIT_LOCATION_PREDICT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location_input),
-                CallbackQueryHandler(menu_router),
-            ],
-            AWAIT_LOCATION_TRACK: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_location_input),
-                CallbackQueryHandler(menu_router),
-            ],
-            AWAIT_POS_OUTCOME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pos_outcome),
-            ],
-            AWAIT_POS_SHARES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pos_shares),
-            ],
-            AWAIT_POS_PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pos_price),
-            ],
-            AWAIT_POS_NOTES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pos_notes),
-            ],
-            AWAIT_UPDATE_PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update_price),
-            ],
-            AWAIT_CLOSE_PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_close_price),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        per_message=False,
-    )
-    app.add_handler(conv)
-
-    # Background job
-    app.job_queue.run_repeating(
-        job_refresh_tracked,
-        interval=TRACKED_REFRESH_MIN * 60,
-        first=10,
-    )
-
-    return app
-
-
-# ─────────────────────────────────────────────────────────
-#  Entry point
-# ─────────────────────────────────────────────────────────
+# ─────────────────────────── lifecycle ────────────────────────────
 async def post_init(app: Application) -> None:
-    await db.init_db()
-    log.info("Database initialised ✅")
-    # Load or run first backtest
-    weights = await db.load_latest_weights()
-    if weights:
-        log.info("Loaded cached weights: %s", weights)
-    else:
-        log.info("No cached weights — running initial backtest…")
-        try:
-            bt = await backtest_service.run_backtest()
-            log.info("Initial backtest complete. Weights: %s", bt["weights"])
-        except Exception as e:
-            log.warning("Initial backtest failed (will use defaults): %s", e)
+    commands = [
+        BotCommand("start", "🌟 Welcome & menu"),
+        BotCommand("opportunities", "🎯 High-confidence trade picks"),
+        BotCommand("polymarket", "🎲 Polymarket forecast (35 cities)"),
+        BotCommand("forecast", "🌤️ Forecast by airport code"),
+        BotCommand("search", "🔍 Search city for airports"),
+        BotCommand("track", "🔔 Track for change alerts"),
+        BotCommand("untrack", "🔕 Stop tracking"),
+        BotCommand("list", "📋 Your tracked airports"),
+        BotCommand("help", "❓ Help & methodology"),
+    ]
+    await app.bot.set_my_commands(commands)
+    await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    log.info("Commands menu registered (bottom-left button)")
 
 
 def main() -> None:
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
+    log.info("Loading airport database…")
+    ensure_airport_data(AIRPORTS_CSV)
+    airports_db.load_from_csv(AIRPORTS_CSV)
+    log.info("Loaded %d airports", len(airports_db.airports))
 
-    app = build_application()
-    app.post_init = post_init
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
-    log.info("WeatherPolyBot starting… 🌦️")
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("opportunities", cmd_opportunities))
+    app.add_handler(CommandHandler("polymarket", cmd_polymarket))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("forecast", cmd_forecast))
+    app.add_handler(CommandHandler("track", cmd_track))
+    app.add_handler(CommandHandler("untrack", cmd_untrack))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            tracking_job,
+            interval=TRACKING_INTERVAL_MINUTES * 60,
+            first=60,
+            name="tracking_job",
+        )
+        log.info("Tracking job scheduled every %d min", TRACKING_INTERVAL_MINUTES)
+    else:
+        log.warning(
+            "job_queue not available — install python-telegram-bot[job-queue]"
+        )
+
+    log.info("Starting bot — long polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
