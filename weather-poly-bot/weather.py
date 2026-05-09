@@ -465,3 +465,213 @@ async def _fetch_open_meteo_current(lat: float, lon: float) -> Optional[CurrentO
         )
     except Exception:
         return None
+
+
+# ─────────────────────────── position-miss probability ────────────────────
+@dataclass
+class PositionRisk:
+    """How likely a Polymarket position is to miss its target bucket today.
+
+    This is a real-time estimate that fuses:
+      - METAR-observed max so far today (hard floor on outcome)
+      - HRRR (or regional equivalent) hourly projection for remaining hours
+      - Global ensemble's predicted day-max as a sanity check
+    """
+    p_miss: float                # 0..1 — probability the actual high lies outside the bucket
+    observed_max_c: Optional[float]
+    projected_max_c: float       # blended estimate of today's actual max
+    sigma_c: float               # uncertainty
+    metar_temp_c: Optional[float]   # current METAR temp
+    metar_trend: Optional[str]      # 'rising' | 'falling' | 'steady'
+    hrrr_max_c: Optional[float]     # HRRR's projected remaining-day max
+    bucket_low_c: float
+    bucket_high_c: float
+
+
+async def compute_position_risk(
+    lat: float, lon: float, icao: str,
+    bucket_low_c: float, bucket_high_c: float,
+    target_date: date,
+) -> Optional[PositionRisk]:
+    """Compute live P(miss) for a position. Returns None if data is too stale
+    or the date isn't today (we only do live signals for the current day)."""
+    today_local = datetime.now().astimezone().date()
+    # We don't have city's timezone here, but the caller filters to today
+    # already; date alignment is done upstream.
+
+    # 1) METAR — past 24 hours, find max-so-far and current temp + trend
+    metar_max, metar_now, metar_trend = await _metar_max_and_trend(icao)
+
+    # 2) HRRR / regional — hourly temps for the rest of today
+    regional = _select_regional_model(lat, lon)
+    hrrr_max = await _hrrr_remaining_max(lat, lon, regional, target_date)
+
+    # 3) Global ensemble — daily max for today as a sanity check
+    forecasts = await fetch_ensemble_forecast(lat, lon, days=1, icao=icao)
+    ensemble_max = forecasts[0].ensemble_mean_c if forecasts else None
+    ensemble_sigma = forecasts[0].std_c if forecasts else 1.5
+
+    # Build the projected max estimate.
+    components = []
+    if metar_max is not None:
+        components.append(("metar_floor", metar_max, 0.0))  # hard floor, no uncertainty
+    if hrrr_max is not None:
+        components.append(("hrrr", hrrr_max, 0.6))
+    if ensemble_max is not None:
+        components.append(("ensemble", ensemble_max, ensemble_sigma))
+
+    if not components:
+        return None
+
+    # The projected max is the larger of (observed-so-far) and (max of remaining-day forecast).
+    # Specifically: floor by metar_max, then weighted-blend the forecast components.
+    floor = metar_max if metar_max is not None else -999
+    forecast_components = [(name, v, s) for name, v, s in components if name != "metar_floor"]
+    if forecast_components:
+        # Weighted blend favoring HRRR when it's available
+        w_hrrr = 0.7 if hrrr_max is not None else 0.0
+        w_ens = 1.0 - w_hrrr
+        if hrrr_max is not None and ensemble_max is not None:
+            blended = w_hrrr * hrrr_max + w_ens * ensemble_max
+            blended_sigma = max(0.5, ensemble_sigma * 0.6)  # HRRR shrinks σ
+        elif hrrr_max is not None:
+            blended = hrrr_max
+            blended_sigma = 0.7
+        else:
+            blended = ensemble_max
+            blended_sigma = ensemble_sigma
+    else:
+        # Only metar — past tense, day high already happened
+        blended = floor
+        blended_sigma = 0.5
+
+    projected_max = max(floor, blended)
+
+    # Compute P(actual max < bucket_low) + P(actual max > bucket_high), under
+    # a Gaussian centered on projected_max. But: if metar_max is already inside
+    # or above the bucket, certain branches are zero/one.
+    p_below = 0.0
+    p_above = 0.0
+    if metar_max is not None and metar_max > bucket_high_c:
+        # Already exceeded — definite miss above.
+        p_above = 1.0
+    elif metar_max is not None and metar_max >= bucket_low_c:
+        # Already inside or above the floor of bucket — can only go up from here.
+        # P(below) is 0; P(above) is P(future_max > bucket_high).
+        p_above = _prob_max_exceeds(projected_max, blended_sigma, bucket_high_c)
+    else:
+        # Day still open below the bucket. Could miss low or high.
+        p_below = _prob_max_below(projected_max, blended_sigma, bucket_low_c)
+        p_above = _prob_max_exceeds(projected_max, blended_sigma, bucket_high_c)
+
+    p_miss = max(0.0, min(1.0, p_below + p_above))
+
+    return PositionRisk(
+        p_miss=p_miss,
+        observed_max_c=metar_max,
+        projected_max_c=projected_max,
+        sigma_c=blended_sigma,
+        metar_temp_c=metar_now,
+        metar_trend=metar_trend,
+        hrrr_max_c=hrrr_max,
+        bucket_low_c=bucket_low_c,
+        bucket_high_c=bucket_high_c,
+    )
+
+
+def _prob_max_below(mu: float, sigma: float, threshold: float) -> float:
+    """P(actual < threshold) under N(mu, sigma)."""
+    if sigma <= 0.01:
+        return 1.0 if mu < threshold else 0.0
+    z = (threshold - mu) / sigma
+    return _norm_cdf(z)
+
+
+def _prob_max_exceeds(mu: float, sigma: float, threshold: float) -> float:
+    return 1.0 - _prob_max_below(mu, sigma, threshold + 1.0)
+    # +1 because the bucket is closed at the top: bucket "62-63°F" includes
+    # values up to 63.99°F. Using threshold+1 gives us P(max >= threshold+1).
+
+
+async def _metar_max_and_trend(
+    icao: str, hours: int = 12
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Returns (max_temp_so_far_c, latest_temp_c, trend)."""
+    params = {"ids": icao, "format": "json", "taf": "false", "hours": hours}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(AVIATION_WX_METAR, params=params)
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        return None, None, None
+    if not data:
+        return None, None, None
+    # METAR returns reverse-chronological. Get observations with valid temps.
+    obs = []
+    for ob in data:
+        t = ob.get("temp")
+        rt = ob.get("reportTime")
+        if isinstance(t, (int, float)):
+            obs.append((rt, float(t)))
+    if not obs:
+        return None, None, None
+    temps = [t for _, t in obs]
+    latest = temps[0]
+    max_temp = max(temps)
+    # Trend: compare latest 30-min mean to previous 30-min mean
+    if len(temps) >= 4:
+        recent = sum(temps[:2]) / 2
+        prior = sum(temps[2:4]) / 2
+        if recent > prior + 0.3:
+            trend = "rising"
+        elif recent < prior - 0.3:
+            trend = "falling"
+        else:
+            trend = "steady"
+    else:
+        trend = None
+    return max_temp, latest, trend
+
+
+async def _hrrr_remaining_max(
+    lat: float, lon: float, regional: Optional[str], target_date: date,
+) -> Optional[float]:
+    """HRRR (or regional) projected max for remaining hours of target_date."""
+    if not regional:
+        return None
+    params = {
+        "latitude": lat, "longitude": lon,
+        "hourly": "temperature_2m",
+        "temperature_unit": "celsius",
+        "timezone": "auto",
+        "forecast_days": 2,
+        "models": regional,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(OPEN_METEO_FORECAST, params=params)
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        return None
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    temp_key = f"temperature_2m_{regional}"
+    temps = hourly.get(temp_key) or hourly.get("temperature_2m")
+    if not times or not temps:
+        return None
+    target_iso = target_date.isoformat()
+    now_iso = datetime.now().astimezone().isoformat(timespec="hours")[:13]
+    remaining = []
+    for t_str, t_val in zip(times, temps):
+        if not t_str.startswith(target_iso):
+            continue
+        if t_str < now_iso:
+            continue
+        if t_val is not None:
+            try:
+                remaining.append(float(t_val))
+            except (TypeError, ValueError):
+                continue
+    return max(remaining) if remaining else None

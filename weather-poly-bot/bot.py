@@ -12,8 +12,9 @@ Features:
 import asyncio
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand,
@@ -63,6 +64,8 @@ from tracking import TrackingDB
 from weather import (
     DayForecast,
     MODEL_DISPLAY,
+    PositionRisk,
+    compute_position_risk,
     fetch_current_observation,
     fetch_ensemble_forecast,
 )
@@ -834,10 +837,20 @@ async def show_opportunity_detail(
             f"*{int(round(p.model_p*100))}%* model · edge *{edge}*\n"
             f"   _EV per $1: {ev_per_d}_  {_md_link('▶ Trade', p.bucket.trade_url)}"
         )
-        keyboard.append([InlineKeyboardButton(
-            f"{emoji} {p.bucket.label} ({int(round(p.market_p*100))}%)",
-            url=p.bucket.trade_url,
-        )])
+        # Two buttons per bucket: Trade (external) + Track Position (callback)
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{emoji} Trade {p.bucket.label} ({int(round(p.market_p*100))}%)",
+                url=p.bucket.trade_url,
+            ),
+            InlineKeyboardButton(
+                "📌 Track",
+                callback_data=(
+                    f"trkpos:{city_key}:{opp.target_date.isoformat()}:"
+                    f"{p.bucket.market_slug}"
+                ),
+            ),
+        ])
 
     lines.append("")
     lines.append(
@@ -858,6 +871,301 @@ async def show_opportunity_detail(
         reply_markup=InlineKeyboardMarkup(keyboard),
         disable_web_page_preview=True,
     )
+
+
+# ─────────────────────────── Position tracking (v9) ───────────────────────
+# Alert when a tracked Polymarket position has ≥50% chance of missing its
+# bucket. Re-alert each hour while in danger zone.
+POSITION_ALERT_THRESHOLD = 0.50
+POSITION_REALERT_HOURS = 1.0
+POSITION_SCAN_HOUR_START = 12   # city local
+POSITION_SCAN_HOUR_END = 17     # city local (peak heating)
+
+
+def _bucket_to_celsius(low: int, high: int, unit: str) -> Tuple[float, float]:
+    """Return (low_c, high_c) regardless of bucket's display unit."""
+    if unit == "C":
+        return float(low), float(high)
+    # Fahrenheit → Celsius. Use the actual edges (the bucket "62-63°F" covers
+    # values from 62.0°F up to 63.99°F, so cap is 63 + 0.99 ~ 63.99).
+    return ((low - 32) * 5 / 9, (high + 0.99 - 32) * 5 / 9)
+
+
+async def cmd_track_position(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List user's current tracked positions and offer to add a new one
+    by tapping into the existing Polymarket flow."""
+    user_id = update.effective_user.id
+    rows = tracking_db.list_user_positions(user_id)
+
+    lines = [
+        "📌 *Your tracked Polymarket positions*",
+        "",
+    ]
+    if not rows:
+        lines.append("_None yet._")
+    else:
+        for r in rows:
+            (pid, city_key, target_date, kind, lo, hi, label,
+             unit, last_alert_at, last_alert_p) = r
+            cfg = SUPPORTED_CITIES.get(city_key)
+            city_name = cfg.display if cfg else city_key
+            lines.append(f"📌 *#{pid}* {city_name} · {target_date} · *{label}*")
+            if last_alert_p is not None:
+                lines.append(
+                    f"   _Last alert: P(miss)={int(last_alert_p*100)}%_"
+                )
+
+    lines.append("")
+    lines.append(
+        "*To track a new position:* find it via 🎲 Polymarket or 🎯 Opportunities, "
+        "then tap the *📌 Track Position* button next to the bucket."
+    )
+    lines.append(
+        "*To stop tracking:* /untrack\\_position `<id>` (e.g. `/untrack_position 3`)"
+    )
+    lines.append("")
+    lines.append(
+        f"_Bot scans every 15 min during 12pm–5pm city local. Alerts at "
+        f"≥{int(POSITION_ALERT_THRESHOLD*100)}% chance of missing the bucket, "
+        f"re-alerts every {int(POSITION_REALERT_HOURS)}h while in danger zone._"
+    )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_untrack_position(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not ctx.args:
+        await update.effective_message.reply_text(
+            "Usage: `/untrack_position <id>` (find the id via /track\\_position)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    try:
+        pid = int(ctx.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ ID must be a number.")
+        return
+    user_id = update.effective_user.id
+    if tracking_db.remove_position(user_id, pid):
+        await update.effective_message.reply_text(
+            f"✅ Stopped tracking position *#{pid}*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"ℹ️ No tracked position with id *#{pid}* found for you.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def add_position_from_callback(
+    update: Update, city_key: str, target_date_iso: str, market_slug: str,
+) -> None:
+    """Triggered from the 📌 Track Position button on a bucket. Looks up the
+    market again, finds the bucket by slug, and saves the position."""
+    cfg = SUPPORTED_CITIES.get(city_key)
+    if not cfg:
+        await update.effective_message.reply_text("❌ Unknown city.")
+        return
+    try:
+        td = date.fromisoformat(target_date_iso)
+    except ValueError:
+        await update.effective_message.reply_text("❌ Bad date.")
+        return
+
+    market = await get_market_for_city(city_key, td)
+    if not market:
+        await update.effective_message.reply_text(
+            "❌ Market no longer available."
+        )
+        return
+    bucket = next((b for b in market.buckets if b.market_slug == market_slug), None)
+    if not bucket:
+        await update.effective_message.reply_text(
+            "❌ That bucket isn't in the market anymore."
+        )
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    added = tracking_db.add_position(
+        user_id, chat_id, city_key, target_date_iso,
+        bucket.kind, bucket.value, bucket.hi, bucket.label, market.unit,
+    )
+    if added:
+        await update.effective_message.reply_text(
+            f"✅ Tracking position: *{cfg.display}* · {target_date_iso} · "
+            f"*{bucket.label}*\n\n"
+            f"You'll get a Telegram alert if the chance of *missing* this "
+            f"bucket reaches *{int(POSITION_ALERT_THRESHOLD*100)}%*. Scans run "
+            f"every 15 min during peak heating (12pm–5pm city local).\n\n"
+            f"To stop: /track\\_position to see your list, then "
+            f"/untrack\\_position `<id>`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.effective_message.reply_text(
+            "ℹ️ You're already tracking this position."
+        )
+
+
+async def position_scan_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs every 15 minutes. Computes P(miss) for every tracked position
+    where the city's local time is within the 12pm–5pm peak heating window,
+    and fires an alert if P(miss) ≥ 50%, re-alerting at most once per hour."""
+    # Purge expired positions (whose target_date is yesterday or earlier)
+    today_utc = datetime.utcnow().date().isoformat()
+    purged = tracking_db.purge_expired_positions(today_utc)
+    if purged:
+        log.info("position_scan: purged %d expired positions", purged)
+
+    positions = tracking_db.list_all_positions()
+    if not positions:
+        return
+
+    now_utc = datetime.utcnow()
+    for row in positions:
+        (pid, user_id, chat_id, city_key, target_date_iso, kind,
+         lo, hi, label, unit, last_alert_at, last_alert_p) = row
+
+        cfg = SUPPORTED_CITIES.get(city_key)
+        if not cfg:
+            continue
+
+        # Only scan during city's peak heating window
+        try:
+            now_local = datetime.now(ZoneInfo(cfg.timezone))
+        except Exception:
+            continue
+        if not (POSITION_SCAN_HOUR_START <= now_local.hour < POSITION_SCAN_HOUR_END):
+            continue
+
+        # Only alert about today's positions (live signal needs live data)
+        local_today = now_local.date()
+        try:
+            target_date = date.fromisoformat(target_date_iso)
+        except ValueError:
+            continue
+        if target_date != local_today:
+            continue
+
+        bucket_low_c, bucket_high_c = _bucket_to_celsius(lo, hi, unit)
+
+        try:
+            risk = await compute_position_risk(
+                cfg.resolves_at_lat, cfg.resolves_at_lon,
+                cfg.resolves_at_icao,
+                bucket_low_c, bucket_high_c, target_date,
+            )
+        except Exception:
+            log.exception("position_scan: risk calc failed for #%d", pid)
+            continue
+        if risk is None:
+            continue
+
+        if risk.p_miss < POSITION_ALERT_THRESHOLD:
+            continue
+
+        # Re-alert throttle: only re-alert if last alert was ≥1h ago.
+        if last_alert_at:
+            try:
+                last_dt = datetime.fromisoformat(last_alert_at)
+                hours_since = (now_utc - last_dt).total_seconds() / 3600.0
+                if hours_since < POSITION_REALERT_HOURS:
+                    continue
+            except ValueError:
+                pass
+
+        # Build alert
+        msg = _format_exit_alert(pid, cfg, label, risk, target_date)
+        try:
+            keyboard = [
+                [
+                    InlineKeyboardButton("🎲 View market",
+                        callback_data=f"pm:{city_key}"),
+                    InlineKeyboardButton(f"🔕 Untrack #{pid}",
+                        callback_data=f"untrackpos:{pid}"),
+                ]
+            ]
+            await ctx.bot.send_message(
+                chat_id, msg,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True,
+            )
+            tracking_db.update_position_alert(pid, risk.p_miss)
+            log.info("position_scan: alert sent for #%d (P=%.2f)",
+                     pid, risk.p_miss)
+        except Exception:
+            log.exception("position_scan: failed to send alert for #%d", pid)
+
+
+def _format_exit_alert(
+    pid: int, cfg, bucket_label: str, risk: PositionRisk, target_date: date,
+) -> str:
+    """Format the exit-signal alert message."""
+    p_pct = int(round(risk.p_miss * 100))
+    severity = "🚨" if p_pct >= 80 else "⚠️"
+
+    lines = [
+        f"{severity} *Exit signal — Position #{pid}*",
+        f"📍 {cfg.display} · {target_date.strftime('%b %d')}",
+        f"📌 Bucket: *{bucket_label}*",
+        "",
+        f"*Chance of MISSING bucket: {p_pct}%*",
+        "",
+        "*Live data:*",
+    ]
+    if risk.metar_temp_c is not None:
+        f_now = risk.metar_temp_c * 9 / 5 + 32
+        trend_emoji = (
+            "📈" if risk.metar_trend == "rising"
+            else "📉" if risk.metar_trend == "falling"
+            else "➡️"
+        )
+        lines.append(
+            f"   📡 METAR now: {int(round(f_now))}°F / "
+            f"{int(round(risk.metar_temp_c))}°C  {trend_emoji}"
+        )
+    if risk.observed_max_c is not None:
+        f_max = risk.observed_max_c * 9 / 5 + 32
+        lines.append(
+            f"   🌡️ Max so far today: "
+            f"{int(round(f_max))}°F / {int(round(risk.observed_max_c))}°C"
+        )
+    if risk.hrrr_max_c is not None:
+        f_h = risk.hrrr_max_c * 9 / 5 + 32
+        lines.append(
+            f"   🛰️ HRRR projects rest-of-day max: "
+            f"{int(round(f_h))}°F / {int(round(risk.hrrr_max_c))}°C"
+        )
+    f_proj = risk.projected_max_c * 9 / 5 + 32
+    lines.append(
+        f"   🎯 Blended projection: "
+        f"*{int(round(f_proj))}°F / {int(round(risk.projected_max_c))}°C* "
+        f"(±{risk.sigma_c:.1f}°C)"
+    )
+    lines.append("")
+    f_blo = risk.bucket_low_c * 9 / 5 + 32
+    f_bhi = risk.bucket_high_c * 9 / 5 + 32
+    lines.append(
+        f"_Bucket needs final max in "
+        f"{int(round(f_blo))}–{int(round(f_bhi))}°F_"
+    )
+    if risk.observed_max_c is not None and risk.observed_max_c > risk.bucket_high_c:
+        lines.append("⛔ *Already exceeded bucket high — position cannot recover.*")
+    elif risk.projected_max_c > risk.bucket_high_c + 1:
+        lines.append("📈 _Projected high is above bucket → consider exiting._")
+    elif risk.projected_max_c < risk.bucket_low_c - 1:
+        lines.append("📉 _Projected high is below bucket → consider exiting._")
+
+    return "\n".join(lines)
 
 
 async def track_airport(update: Update, code: str) -> None:
@@ -1062,6 +1370,24 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except ValueError:
             return
         await show_opportunity_detail(update, city_key, date_iso)
+    elif data.startswith("trkpos:"):
+        # trkpos:<city_key>:<YYYY-MM-DD>:<market_slug>
+        rest = data[7:]
+        try:
+            city_key, date_iso, market_slug = rest.split(":", 2)
+        except ValueError:
+            return
+        await add_position_from_callback(update, city_key, date_iso, market_slug)
+    elif data.startswith("untrackpos:"):
+        try:
+            pid = int(data[11:])
+        except ValueError:
+            return
+        if tracking_db.remove_position(update.effective_user.id, pid):
+            await q.message.reply_text(
+                f"✅ Stopped tracking position *#{pid}*.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
 
 _AIRPORT_CODE_RE = re.compile(r"^[A-Za-z]{3,4}$")
@@ -1216,9 +1542,11 @@ async def post_init(app: Application) -> None:
         BotCommand("polymarket", "🎲 Polymarket forecast (35 cities)"),
         BotCommand("forecast", "🌤️ Forecast by airport code"),
         BotCommand("search", "🔍 Search city for airports"),
-        BotCommand("track", "🔔 Track for change alerts"),
-        BotCommand("untrack", "🔕 Stop tracking"),
+        BotCommand("track", "🔔 Track airport for temp-change alerts"),
+        BotCommand("untrack", "🔕 Stop tracking airport"),
         BotCommand("list", "📋 Your tracked airports"),
+        BotCommand("track_position", "📌 Your tracked Polymarket positions"),
+        BotCommand("untrack_position", "🔕 Stop tracking a position"),
         BotCommand("help", "❓ Help & methodology"),
     ]
     await app.bot.set_my_commands(commands)
@@ -1248,6 +1576,8 @@ def main() -> None:
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("track_position", cmd_track_position))
+    app.add_handler(CommandHandler("untrack_position", cmd_untrack_position))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
@@ -1259,6 +1589,16 @@ def main() -> None:
             name="tracking_job",
         )
         log.info("Tracking job scheduled every %d min", TRACKING_INTERVAL_MINUTES)
+        # New v9: position-level exit-signal scanner, every 15 minutes.
+        # The job itself only acts when a tracked position's city is in its
+        # 12pm–5pm peak heating window, so off-peak scans are no-ops.
+        app.job_queue.run_repeating(
+            position_scan_job,
+            interval=15 * 60,
+            first=120,
+            name="position_scan_job",
+        )
+        log.info("Position scan job scheduled every 15 min")
     else:
         log.warning(
             "job_queue not available — install python-telegram-bot[job-queue]"

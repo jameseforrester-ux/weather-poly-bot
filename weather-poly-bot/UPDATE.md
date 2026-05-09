@@ -1,112 +1,78 @@
-# Weather Bot — Update v8 (HRRR / regional models + METAR floor + OpenWeather)
+# Weather Bot — Update v9 (Position-level exit-signal alerts)
 
 ## What's new
 
-### 🛰️ Regional high-res models, auto-selected per location
+A new alert type: **exit signals for tracked Polymarket positions**. Tells you
+when a position you've taken is likely to lose, so you can close it out at a
+better price than waiting for it to resolve.
 
-Each Polymarket city now uses the best regional NWP model available:
+### How it works
+1. Find a bucket via 🎲 Polymarket or 🎯 Opportunities
+2. Tap the new **📌 Track** button next to any bucket
+3. Bot scans every 15 min during 12pm–5pm city local
+4. When P(miss) ≥ 50%, you get a Telegram alert with:
+   - Current METAR temp + trend (rising/falling/steady)
+   - Max observed so far today
+   - HRRR's projected rest-of-day max
+   - Blended projection vs your bucket
+   - "Already exceeded — cannot recover" if applicable
+5. Re-alerts hourly while still in danger zone (until you /untrack_position)
 
-| Region | Model | Resolution | Coverage |
-|---|---|---|---|
-| US (NYC, LA, Chicago, etc.) | NOAA HRRR | 3km | CONUS, 0–18h, hourly updates |
-| Canada (Toronto) | EC HRDPS | 2.5km | Canada, 0–48h |
-| UK (London) | UKMO 2km | 2km | UK + Ireland, 0–48h |
-| France (Paris) | Météo-France AROME HD | 1.5km | France + neighbors, 0–42h |
-| Wider Europe (Madrid, Warsaw, Helsinki, Moscow, Ankara, Tel Aviv) | ARPEGE Europe | 11km | Europe, 0–114h |
-| Japan (Tokyo) | JMA MSM | 5km | Japan, 0–78h |
-| Asia / SA / Africa / Oceania | _falls back to global ensemble_ | | |
+### How P(miss) is computed
+- METAR observations = ground truth for what already happened
+- HRRR (or regional equivalent) projects remaining hours of the day
+- Global ensemble as sanity check
+- The blended projection's Gaussian gives P(actual_max < bucket_low) +
+  P(actual_max > bucket_high) = P(miss)
 
-When a regional model returns data, it gets **30%** of the blend weight,
-with the rest of the weight redistributed proportionally among the global
-models (ECMWF IFS still leads at 16-17%).
+### New commands
+- `/track_position` — see your tracked positions
+- `/untrack_position <id>` — stop tracking a specific position
 
-When no regional applies, the existing 8-model global ensemble runs as
-before, with ECMWF IFS slightly bumped to 25% (was 22%).
+### New buttons
+- 📌 Track button on each bucket in opportunity-detail view
+- 🔕 Untrack button on each alert message
 
-### 📡 METAR observed-max floor for today
+## Files
 
-For today's forecast specifically: we pull METAR observations from the past
-12 hours at the airport. The max observed temperature so far is used as a
-**hard floor** on the predicted max — because you can't have a daily max
-less than what already happened. If the floor displaces the model's
-prediction, uncertainty is bumped slightly (the forecast under-shot).
+| File | Status |
+|---|---|
+| `tracking.py` | New `positions` table (auto-migrates) + position add/remove/list |
+| `weather.py` | New `compute_position_risk()` + METAR trend + HRRR remaining-day max |
+| `bot.py` | New `/track_position`, `/untrack_position`, scanner job, alert formatter, callback handlers |
 
-This is the "absolute truth" anchor you asked for: METAR observations
-trump model predictions when they conflict.
-
-### 🌐 OpenWeather added (optional)
-
-When `OPENWEATHER_API_KEY` is set in `.env`, OpenWeather's daily-max forecast
-joins the ensemble with a small **5%** weight as a cross-source check. If
-not set, it's silently skipped — no behavior change.
-
----
-
-## Files in this zip
-
-| File | Status | Notes |
-|---|---|---|
-| `weather.py` | Major changes | Regional model selection, METAR floor, OpenWeather, weight rebalancing |
-| `bot.py` | Small changes | Pass `icao` to `fetch_ensemble_forecast` at all 5 call sites |
-| `env.example` | Renamed from `.env.example` to be visible | Adds `OPENWEATHER_API_KEY` config |
-
-No new Python dependencies. No DB migration.
+No new Python dependencies. Database auto-migrates on first run.
 
 ---
 
 ## DEPLOY — STEP BY STEP
 
-### Part A — On your laptop
+### Part A — Laptop
 
-**1. Unzip** `weather-bot-update-v8.zip`. You get `bot.py`, `weather.py`,
-   `env.example`, and `UPDATE.md`.
+**1.** Unzip `weather-bot-update-v9.zip`. You get `bot.py`, `weather.py`,
+   `tracking.py`, and `UPDATE.md`.
 
-**2. Open your local weather-bot repo folder** on your computer.
+**2.** Open your local weather-bot repo folder.
 
-**3. Drag `bot.py` and `weather.py`** into your repo folder, replacing the
-   old versions. Don't drag `env.example` or `UPDATE.md`.
+**3.** Drag `bot.py`, `weather.py`, and `tracking.py` into your repo folder,
+   replacing the existing versions. Don't drag `UPDATE.md`.
 
-**4. Open your weather-bot repo on GitHub** in the browser.
+**4.** Open your weather-bot repo on GitHub in the browser.
 
-**5. Add file → Upload files.** Drag `bot.py` and `weather.py` into the
-   upload area. GitHub will note both files are being replaced — that's
-   correct.
+**5.** Add file → Upload files → drag the three .py files. GitHub will say
+   they're being replaced — that's correct.
 
-**6. Commit message:**
+**6.** Commit message:
 ```
-v8: HRRR/regional models + METAR floor + OpenWeather (optional)
+v9: Position-level exit-signal alerts (METAR + HRRR + ensemble)
 ```
 Click **Commit changes**.
 
-### Part B — On the VPS in PuTTY
+### Part B — VPS in PuTTY
 
-**7. Pull the new code:**
 ```bash
 cd ~/weather-bot
 git pull
-```
-
-**8. (Optional) Add your OpenWeather API key.** This step is only if you
-want OpenWeather added to the blend. Skip if you're happy without it.
-
-  a. Get a free API key at https://openweathermap.org/api → "One Call API 3.0"
-     (the free tier is 1,000 calls/day, way more than the bot will use).
-
-  b. Edit your `.env` file in PuTTY:
-```bash
-nano ~/weather-bot/.env
-```
-
-  c. Find the line `LOG_LEVEL=INFO` and below it add a new line:
-```
-OPENWEATHER_API_KEY=your_key_here
-```
-   (Paste your actual key in place of `your_key_here`. No spaces, no quotes.)
-
-  d. Save: `Ctrl+O`, press Enter, then `Ctrl+X` to exit.
-
-**9. Restart the bot:**
-```bash
 sudo systemctl restart weather-bot
 sleep 3
 sudo systemctl status weather-bot --no-pager
@@ -116,45 +82,60 @@ You want `Active: active (running)`. Press `q` to exit.
 
 ### Part C — Verify
 
-**10. Watch logs while testing:**
+**Watch logs while testing:**
 ```bash
 sudo journalctl -u weather-bot -f
 ```
 
-**11. In Telegram, run `/forecast KJFK`.** In the live logs you should see:
-- `metar floor: ... raised ...` (only if today's high already happened — i.e. it's afternoon)
-- No errors
+You should see startup lines including:
+```
+Tracking job scheduled every 30 min
+Position scan job scheduled every 15 min
+Loaded NN airports
+Starting bot — long polling
+```
 
-**12. Check that regional models are firing.** Run `/forecast EGLL` (London).
-The bot's response is the same format as before — but if you have
-`/forecast KJFK` showing a slightly different prediction than before, that's
-HRRR doing its job. (You won't see HRRR explicitly named in the user-facing
-text; if you want me to add a "Sources used" footer line, let me know.)
+Press Ctrl+C when done (bot keeps running).
 
-**13. Press Ctrl+C** to exit logs (bot keeps running).
+**In Telegram:**
+1. `/start` — should now show 📌 commands in the bot menu
+2. Tap **🎯 Opportunities** → tap any opportunity → **Details**
+3. You should see new **📌 Track** buttons next to each bucket's Trade button
+4. Tap **📌 Track** on a bucket → bot confirms the position is tracked
+5. `/track_position` → see your list with each position's ID
+6. To remove: `/untrack_position 1` (or use the 🔕 button on alert messages)
+
+The exit-signal alert will fire when:
+- Today is the position's target date
+- City local time is between 12pm and 5pm
+- P(miss) reaches ≥50%
+- It's been ≥1h since the last alert for that position
+
+So if you track an NYC position right now and it's currently 1pm ET, you
+might get an alert within 15 minutes if conditions warrant. Outside the
+12-5pm window, no alerts fire (forecast risk is mostly settled by then or
+hasn't started building).
 
 ---
 
 ## Troubleshooting
 
-**Bot fails to start after pull:**
+**Bot fails to restart:**
 ```bash
 sudo journalctl -u weather-bot -n 30 --no-pager
 ```
-Paste the last 20 lines if anything's wrong.
+Paste the last 20 lines if anything looks wrong.
 
-**OpenWeather API key invalid:**
-The bot silently skips OpenWeather if the key is wrong or absent. Check the
-log for `openweather fetch failed:` lines. Get a new key at
-openweathermap.org if needed.
+**Tracked position but no alerts:**
+Check whether you're inside any city's 12pm–5pm window:
+```bash
+sudo journalctl -u weather-bot -f | grep position_scan
+```
+You should see scan attempts every 15 min. Lines like
+`position_scan: alert sent for #N` mean an alert fired. Lack of alert
+during the window means P(miss) is below 50% — your position is still
+healthy.
 
-**Predictions seem unchanged after deploy:**
-Regional models give the biggest boost in the 0–18h horizon (today's max).
-For tomorrow + day after, the global ensemble dominates anyway, so the
-prediction won't shift dramatically. METAR floor only triggers when the
-day's high has already passed and the model under-shot it.
-
-**Want to confirm METAR floor is working?**
-Test on a city in the late afternoon / early evening (after the daily high
-typically occurs). The log will show `metar floor: X.X°C raised ...` if it
-displaced the model.
+**Want to test the alert formatting without waiting for real conditions:**
+Let me know — I can add a `/debug_alert <position_id>` command that fires
+a test alert immediately on demand.
